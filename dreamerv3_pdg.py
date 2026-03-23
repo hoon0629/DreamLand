@@ -54,6 +54,7 @@ import matplotlib.gridspec as gridspec
 from dataclasses import dataclass
 from typing import Optional, Tuple
 import warnings
+import os
 warnings.filterwarnings("ignore")
 
 
@@ -64,8 +65,8 @@ warnings.filterwarnings("ignore")
 @dataclass
 class DreamerConfig:
     # World model
-    obs_dim:       int   = 7       # [x, y, z, vx, vy, vz, mass]
-    action_dim:    int   = 3       # [Tx, Ty, Tz] normalized
+    obs_dim:       int   = 5       # [x, z, vx, vz, mass]
+    action_dim:    int   = 2       # [Tx, Tz] normalized
     embed_dim:     int   = 256     # encoder output dim
     deter_dim:     int   = 512     # GRU hidden (deterministic state h)
     stoch_dim:     int   = 32      # stochastic state z: stoch_dim categories
@@ -83,14 +84,14 @@ class DreamerConfig:
     kl_weight:     float = 1.0
     reward_weight: float = 1.0
     cont_weight:   float = 1.0
-    actor_ent:     float = 3e-4    # actor entropy bonus
+    actor_ent:     float = 2e-3    # actor entropy bonus
 
     # Training
     batch_size:    int   = 16
     seq_len:       int   = 64      # sequence length per batch
     lr_world:      float = 1e-4
-    lr_actor:      float = 3e-5
-    lr_critic:     float = 3e-5
+    lr_actor:      float = 1e-5
+    lr_critic:     float = 1e-4
     grad_clip:     float = 100.0
     buffer_size:   int   = 100_000
 
@@ -108,8 +109,9 @@ class PDGConfig:
     dt:        float = 0.5
     max_steps: int   = 200
     alt_init:  float = 2000.0
-    pos_tol:   float = 5.0
-    vel_tol:   float = 2.0
+    pos_tol:        float = 50.0   # relaxed for training signal
+    pos_tol_strict: float = 5.0   # reported in eval only
+    vel_tol:        float = 2.0
 
 
 # ─────────────────────────────────────────────
@@ -117,24 +119,25 @@ class PDGConfig:
 # ─────────────────────────────────────────────
 
 class MarsPDGEnv:
-    """6-DOF Mars powered descent. State = [x,y,z,vx,vy,vz,mass]."""
+    """2D Mars powered descent. State = [x, z, vx, vz, mass]."""
 
     def __init__(self, cfg: PDGConfig = None):
         self.cfg = cfg or PDGConfig()
         self.g0 = 9.81
         self.state = None
         self.step_count = 0
+        self.training_steps = 0   # set by training loop for phase-based reward
 
-    def reset(self, seed=None):
+    def reset(self, seed=None, difficulty=0.0):
         if seed is not None: np.random.seed(seed)
         c = self.cfg
+        d = difficulty
+        vz_max = -5.0 - 75.0 * d   # difficulty=0: vz=-5 (slow), difficulty=1: vz=-80 (fast)
         self.state = np.array([
-            np.random.uniform(-200, 200),
-            np.random.uniform(-200, 200),
-            c.alt_init + np.random.uniform(-100, 100),
-            np.random.uniform(-30, 30),
-            np.random.uniform(-30, 30),
-            np.random.uniform(-80, -20),
+            np.random.uniform(-200, 200) * d,
+            c.alt_init + np.random.uniform(-100, 100) * d,
+            np.random.uniform(-30, 30) * d,
+            np.random.uniform(vz_max, vz_max * 0.25),
             c.mass * np.random.uniform(0.5, 0.8),
         ], dtype=np.float32)
         self.step_count = 0
@@ -142,45 +145,62 @@ class MarsPDGEnv:
 
     def step(self, action):
         c = self.cfg
-        x, y, z, vx, vy, vz, mass = self.state
+        x, z, vx, vz, mass = self.state
         action = np.clip(action, -1, 1)
-        Tx, Ty, Tz = action * c.T_max
+        Tx, Tz = action * c.T_max
 
         ax = Tx / mass
-        ay = Ty / mass
         az = Tz / mass - c.g
 
-        vx += ax * c.dt;  vy += ay * c.dt;  vz += az * c.dt
-        x  += (self.state[3] + 0.5*ax*c.dt) * c.dt
-        y  += (self.state[4] + 0.5*ay*c.dt) * c.dt
-        z  += (self.state[5] + 0.5*az*c.dt) * c.dt
+        vx += ax * c.dt
+        vz += az * c.dt
+        x  += vx * c.dt
+        z  += vz * c.dt
 
         T_norm = np.linalg.norm(action * c.T_max)
         dm = T_norm / (c.Isp * self.g0) * c.dt
         mass = max(mass - dm, c.mass * 0.1)
 
-        self.state = np.array([x, y, z, vx, vy, vz, mass], dtype=np.float32)
+        self.state = np.array([x, z, vx, vz, mass], dtype=np.float32)
         self.step_count += 1
 
-        # Rewards
-        pos_err = np.sqrt(x**2 + y**2)
-        vel_err = np.linalg.norm([vx, vy, vz])
-        fuel_pen = -T_norm / (c.T_max * 50.0)
-        # Shaped: reward progress toward landing
-        shape  = -0.001 * (pos_err + abs(z)/c.alt_init * 10 + vel_err * 0.1)
-        reward = fuel_pen + shape
+        pos_err = abs(x)
+        vel_err = np.sqrt(vx**2 + vz**2)
+
+        # Paper objective 1: landing error (always active)
+        error_pen = -pos_err * 0.005
+
+        # Paper objective 2: fuel (always active, mild)
+        fuel_pen  = -T_norm / (c.T_max * 150.0)
+
+        # Mild altitude ceiling — flew_away termination handles the hard case
+        alt_pen   = -max(0, z - c.alt_init) * 0.005
+
+        reward = error_pen + fuel_pen + alt_pen
 
         done = False; info = {}
+        # Termination 1: hit the ground
         if z <= 0:
             done = True
-            if pos_err < c.pos_tol and vel_err < c.vel_tol:
-                reward += 200.0
-                info = {"success": True, "pos_err": pos_err, "vel_err": vel_err}
-            else:
-                reward -= 100.0
-                info = {"success": False, "pos_err": pos_err, "vel_err": vel_err}
+            reward += max(0, 200 - pos_err)   # continuous proximity bonus
+            info = {"success": pos_err < c.pos_tol and vel_err < c.vel_tol,
+                    "pos_err": pos_err, "vel_err": vel_err}
+
+        # Termination 2: flew too high
+        elif z > c.alt_init * 1.5:
+            done = True
+            reward -= 100.0
+            info = {"success": False, "flew_away": True}
+
+        # Termination 3: drifted too far horizontally
+        elif pos_err > 2000.0:
+            done = True
+            reward -= 50.0
+            info = {"success": False, "drifted": True}
+
         elif self.step_count >= c.max_steps:
-            done = True; info = {"timeout": True, "success": False}
+            done = True
+            info = {"timeout": True, "success": False}
 
         return self.state.copy(), float(reward), done, info
 
@@ -661,12 +681,12 @@ class DreamerV3(nn.Module):
 
         # ── Actor loss: maximize normalized returns + entropy
         log_probs = imag["log_probs"]  # (H, B)
-        actor_loss = -(norm_returns.detach() * log_probs[:-1]).mean()
+        actor_loss = -(norm_returns[:-1].detach() * log_probs[:-1]).mean()
         ent_loss   = -log_probs[:-1].mean() * cfg.actor_ent
         actor_total = actor_loss + ent_loss
 
         # ── Critic loss: two-hot symlog
-        critic_loss = self.critic.loss(feats[:-1].detach(), returns.detach())
+        critic_loss = self.critic.loss(feats[:-1].detach(), returns[:-1].detach())
 
         return {
             "actor": actor_total,
@@ -805,7 +825,8 @@ def train_dreamerv3(n_env_steps: int = 100_000,
                     train_every: int = 5,
                     seed_episodes: int = 10,
                     device: str = None,
-                    plot: bool = True):
+                    plot: bool = True,
+                    resume_from: str = None):
     """
     Main DreamerV3 training loop for Mars PDG.
 
@@ -832,6 +853,12 @@ def train_dreamerv3(n_env_steps: int = 100_000,
     agent      = DreamerV3(dream_cfg).to(device)
     buffer     = EpisodeBuffer(dream_cfg.buffer_size, dream_cfg.seq_len)
 
+    if resume_from and os.path.exists(resume_from):
+        ckpt = torch.load(resume_from, map_location=device)
+        agent.load_state_dict(ckpt["agent"])
+        print(f"  Resumed from {resume_from}")
+        print(f"  Previous run: ep={ckpt['ep_num']}, steps={ckpt['total_steps']}")
+
     metrics = {"wm_loss": [], "actor_loss": [], "critic_loss": [],
                "reward": [], "ep_return": [], "success_rate": [],
                "env_steps": []}
@@ -843,7 +870,7 @@ def train_dreamerv3(n_env_steps: int = 100_000,
     # ── Seed episodes (random policy)
     print(f"\n  Collecting {seed_episodes} seed episodes...")
     for i in range(seed_episodes):
-        obs = env.reset(seed=i)
+        obs = env.reset(seed=i, difficulty=0.1)
         ep = {"obs": [], "actions": [], "rewards": [], "dones": []}
         done = False
         while not done:
@@ -863,7 +890,8 @@ def train_dreamerv3(n_env_steps: int = 100_000,
     ep_num = 0
     h = z = None  # RSSM state across episode
 
-    obs = env.reset(seed=1000)
+    env.training_steps = 0
+    obs = env.reset(seed=1000, difficulty=0.0)
     h = torch.zeros(1, dream_cfg.deter_dim, device=device)
     z = torch.zeros(1, dream_cfg.stoch_dim * dream_cfg.stoch_classes, device=device)
     ep = {"obs": [], "actions": [], "rewards": [], "dones": []}
@@ -891,8 +919,19 @@ def train_dreamerv3(n_env_steps: int = 100_000,
                       f"return={np.mean(recent_returns):7.1f}  "
                       f"success={np.mean(recent_success)*100:4.0f}%  "
                       f"updates={n_updates}")
+                
+            if ep_num % 100 == 0 and ep_num > 0:
+                torch.save({
+                    "agent":       agent.state_dict(),
+                    "ep_num":      ep_num,
+                    "total_steps": total_steps,
+                    "metrics":     metrics,
+                }, f"dreamerv3_ckpt_ep{ep_num}.pth")
+                print(f"  💾 Checkpoint → dreamerv3_ckpt_ep{ep_num}.pth")
 
-            obs = env.reset()
+            difficulty = min(1.0, total_steps / 100_000)
+            env.training_steps = total_steps
+            obs = env.reset(difficulty=difficulty)
             h = torch.zeros(1, dream_cfg.deter_dim, device=device)
             z = torch.zeros(1, dream_cfg.stoch_dim * dream_cfg.stoch_classes,
                             device=device)
@@ -1000,8 +1039,8 @@ def _plot_training(metrics: dict, eval_results: dict, pdg_cfg: PDGConfig):
 
     ax5 = styled_ax(gs[1, 0:2])
     for traj, res in zip(trajectories[:15], results[:15]):
-        horiz = np.sqrt(traj[:,0]**2 + traj[:,1]**2)
-        alt   = traj[:,2]
+        horiz = traj[:, 0]   # x position (2D: state=[x,z,vx,vz,mass])
+        alt   = traj[:, 1]   # z (altitude)
         color = "#00ff88" if res["success"] else "#ff6b6b"
         ax5.plot(horiz, alt, color=color, alpha=0.6, lw=1.2)
     ax5.axhline(0, color="white", lw=0.5, ls="--")
@@ -1011,13 +1050,14 @@ def _plot_training(metrics: dict, eval_results: dict, pdg_cfg: PDGConfig):
 
     ax6 = styled_ax(gs[1, 2])
     for res, traj in zip(results, trajectories):
-        fx, fy = traj[-1, 0], traj[-1, 1]
-        ax6.scatter(fx, fy, color="#00ff88" if res["success"] else "#ff6b6b",
+        fx = traj[-1, 0]   # final x position
+        ax6.scatter(fx, 0, color="#00ff88" if res["success"] else "#ff6b6b",
                     s=25, alpha=0.7, zorder=3)
-    circ = plt.Circle((0,0), pdg_cfg.pos_tol, color="#ffff00",
-                        fill=False, lw=1.5, ls="--", label=f"±{pdg_cfg.pos_tol}m")
-    ax6.add_patch(circ); ax6.set_aspect("equal")
-    ax6.set_title("Landing Scatter", color="white", fontsize=9)
+    ax6.axvline(0, color="white", lw=0.8, ls="--")
+    ax6.axvspan(-pdg_cfg.pos_tol, pdg_cfg.pos_tol, color="#ffff00",
+                alpha=0.15, label=f"±{pdg_cfg.pos_tol}m")
+    ax6.set_title("Landing Scatter (2D)", color="white", fontsize=9)
+    ax6.set_xlabel("Final x (m)"); ax6.set_yticks([])
     ax6.legend(fontsize=7, facecolor="#161b22", labelcolor="white", edgecolor="#30363d")
 
     ax7 = styled_ax(gs[1, 3])
@@ -1047,30 +1087,16 @@ def _plot_training(metrics: dict, eval_results: dict, pdg_cfg: PDGConfig):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    """
-    Quick start:
-        python dreamerv3_pdg.py
+    import os
 
-    Full training (~100k steps):
-        agent, metrics, eval = train_dreamerv3(
-            n_env_steps=100_000,
-            train_every=5,
-            seed_episodes=10,
-        )
-
-    Resume / load checkpoint:
-        torch.save(agent.state_dict(), "dreamerv3_pdg.pth")
-        agent.load_state_dict(torch.load("dreamerv3_pdg.pth"))
-
-    Key hyperparameters to tune for PDG:
-        dream_cfg.imag_horizon = 15   # longer = better long-range planning
-        dream_cfg.kl_free      = 1.0  # lower = more stochastic world model
-        dream_cfg.actor_ent    = 3e-4 # higher = more exploration
-        pdg_cfg.dt             = 0.5  # sim timestep
-    """
     agent, metrics, eval_results = train_dreamerv3(
-        n_env_steps  = 50_000,   # bump to 200k for convergence
-        train_every  = 5,
-        seed_episodes= 10,
-        plot         = True,
+        n_env_steps   = 300_000,
+        train_every   = 5,
+        seed_episodes = 20,
+        device        = None,   # auto-detects GPU
+        plot          = True,
     )
+
+    torch.save({"agent": agent.state_dict(), "metrics": metrics},
+               "dreamerv3_final.pth")
+    print("Saved → dreamerv3_final.pth")

@@ -1,4 +1,4 @@
-# Conformalized DreamerV3 + MPPI for Hazard-Aware Planetary Landing
+# DreamLand — Conformalized DreamerV3 + MPPI for Hazard-Aware Planetary Landing
 
 A research framework combining a learned world model, sampling-based control,
 and calibrated uncertainty quantification for hazard-aware precision landing
@@ -26,7 +26,7 @@ NASA Terrain Data (Lunar DEM / AI4MARS)
 ## Project Structure
 
 ```
-mars_nav/
+DreamLand/
 ├── README.md                  ← you are here
 │
 ├── mars_nav_pipeline.py       ← Track 1: Mars rover terrain navigation
@@ -51,24 +51,30 @@ Two tracks, same research goal:
 
 ### System
 
-- Python 3.10 or 3.11 recommended
-- CUDA GPU recommended for DreamerV3 training (CPU works but is slow)
+- Python 3.11 recommended
+- CUDA GPU recommended for DreamerV3 training (CPU works but is very slow)
 - 8 GB RAM minimum; 16 GB recommended for DreamerV3
 
-### Install all dependencies
+### Install with conda (recommended)
 
 ```bash
-pip install torch torchvision
-pip install numpy pillow matplotlib scipy
-pip install networkx requests
-pip install lightning-uq-box
-pip install transformers  # for V-JEPA 2 (optional)
+conda env create -f environment.yml
+conda activate dreamland
 ```
 
-One-liner:
+### Install with pip
+
+Install PyTorch first (order matters):
 
 ```bash
-pip install torch torchvision numpy pillow matplotlib scipy networkx requests lightning-uq-box
+# CUDA 12.1 (NVIDIA GPU):
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# CPU only:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Then install remaining dependencies:
+pip install -r requirements.txt
 ```
 
 ### Verify installation
@@ -92,7 +98,7 @@ cost map, and plans a safe path using A*.
 1. Fetches a rover image from NASA API (or uses a synthetic one offline)
 2. Runs DeepLabV3+ terrain segmentation → 4-class label map
 3. Converts labels to traversability cost map
-4. Runs A* path planning from top-left to bottom-right of the map
+4. Runs A* path planning (8-connected grid, diagonal cost = 1.414×)
 5. Saves a 4-panel visualization as `mars_nav_output.png`
 
 **Quick start (no API key, no data download needed):**
@@ -105,12 +111,8 @@ This uses a synthetic Mars-like image generated offline. No internet required.
 
 **With NASA live imagery:**
 
-```bash
-# Get a free key at https://api.nasa.gov
-# Then edit the bottom of mars_nav_pipeline.py:
-```
-
 ```python
+# Get a free key at https://api.nasa.gov
 results = run_pipeline(
     api_key="YOUR_KEY_HERE",
     sol=1000,                # Martian sol — Curiosity has 4000+
@@ -138,6 +140,9 @@ results = run_pipeline(
 | 2 | Sand | 7.0 — risky (slippage) |
 | 3 | Rock | 100.0 — obstacle |
 
+Cells with cost ≥ 50.0 are excluded from the navigation graph.
+Start/goal are snapped to the nearest passable cell if needed.
+
 ---
 
 ### File: `mars_nav_uq_pipeline.py`
@@ -151,8 +156,10 @@ Same pipeline as above, but wraps DeepLabV3+ with **MC Dropout** via
 cost(pixel) = base_terrain_cost × (1 + α × uncertainty)
 ```
 
-A pixel the model is unsure about gets elevated cost even if the predicted
-class is safe. This makes the planner risk-aware, not just obstacle-aware.
+Uncertainty is predictive entropy averaged over MC samples, normalized to
+[0, 1]. A pixel the model is unsure about gets elevated cost even if the
+predicted class is safe. This makes the planner risk-aware, not just
+obstacle-aware.
 
 **Run:**
 
@@ -166,18 +173,28 @@ python mars_nav_uq_pipeline.py
 
 ```python
 results = run_pipeline(
-    uncertainty_alpha=5.0,   # higher → more risk-averse
+    uncertainty_alpha=5.0,   # higher → more risk-averse (default 5.0)
     num_mc_samples=20,        # more samples → better uncertainty estimate
     dropout_p=0.3,
 )
 ```
 
+Note: 20 MC forward passes are run per image. Reduce `num_mc_samples` for
+faster inference at the cost of uncertainty quality.
+
 ---
 
 ### File: `train_ai4mars.py`
 
-Fine-tunes DeepLabV3+ on the real NASA AI4MARS dataset for best accuracy
-(~95% validation accuracy reported in literature).
+Fine-tunes DeepLabV3+ on the real NASA AI4MARS dataset.
+
+**Architecture:**
+- Backbone: ResNet-101 (ImageNet pretrained)
+- Head: 4-class classifier (replaces default COCO head)
+- Loss: 70% Cross-Entropy + 30% Dice, class weights [1.0, 1.2, 2.0, 3.0]
+  (upweights sand and rock to compensate for class imbalance)
+- Optimizer: AdamW, LR 1e-5 (backbone) / 1e-4 (head), weight_decay=1e-4
+- Scheduler: Cosine annealing to 1e-6
 
 **Step 1 — Download AI4MARS:**
 
@@ -186,9 +203,9 @@ Go to https://data.nasa.gov and search "AI4MARS". Download and unzip to:
 ```
 ai4mars/
 ├── images/       ← rover .jpg images (~35K)
-├── labels/       ← .png label maps (pixel values 0–3)
-├── train.txt     ← list of training image IDs
-└── val.txt       ← list of validation image IDs
+├── labels/       ← .png label maps (pixel values 0–3, 255=unlabeled)
+├── train.txt     ← list of training image IDs  (optional)
+└── val.txt       ← list of validation image IDs (optional)
 ```
 
 **Step 2 — Train:**
@@ -203,7 +220,7 @@ python train_ai4mars.py \
 ```
 
 GPU strongly recommended. On an A100 this takes ~2 hours for 30 epochs.
-On CPU this is not feasible; use Google Colab with a GPU runtime instead.
+CPU training is not practical; use Google Colab with a GPU runtime instead.
 
 **Step 3 — Use your fine-tuned weights:**
 
@@ -269,7 +286,6 @@ python dreamerv3_pdg.py
 Default: 50,000 environment steps. For convergence use 200,000+:
 
 ```python
-# Edit bottom of dreamerv3_pdg.py:
 agent, metrics, eval_results = train_dreamerv3(
     n_env_steps=200_000,
     train_every=5,
@@ -310,7 +326,7 @@ At each real timestep t:
   3. For each k, roll H=20 steps using Prior only  [K×H steps]
      → decode each latent → predicted state
      → accumulate cost J_k = Σ c_task + c_hazard + c_control + c_conf
-  4. w_k = softmax(-normalize(J_k) / λ)
+  4. Normalize costs; w_k = softmax(-J_k / λ)
   5. U_t ← U_t + Σ_k w_k · ε_k
   6. Execute U_t[0]; shift U left (warm start)
   7. If all J_k > safety_threshold → fallback brake policy
@@ -320,12 +336,21 @@ At each real timestep t:
 
 | Term | Formula | Weight |
 |------|---------|--------|
-| `c_task` | `‖[x,y]‖² + 0.1·alt` | `w_task=1.0` |
-| `c_vel` | `‖[vx,vy,vz]‖²` | `w_vel=0.5` |
-| `c_control` | `‖action‖²` (fuel) | `w_control=0.05` |
+| `c_task` | `‖[x,y]‖²/pos_norm² + 0.1·alt/alt_norm` | `w_task=1.0` |
+| `c_vel` | `‖[vx,vy,vz]‖²/vel_norm²` | `w_vel=0.5` |
+| `c_control` | `‖action‖²/action_dim` (fuel) | `w_control=0.05` |
 | `c_hazard` | terrain hazard score at (x,y) | `w_hazard=2.0` |
 | `c_conf` | conformal uncertainty penalty | `w_conf=0.0` ← enabled in Phase 5 |
 | `c_terminal` | large pos+vel+crash penalty | `w_terminal=5.0` |
+
+Costs are min-max normalized before applying temperature to ensure numerical
+stability regardless of cost scale.
+
+**Terrain hazard map** is computed as:
+```
+hazard = 0.7 × slope_norm + 0.3 × roughness_norm
+```
+where slope and roughness are derived from the DEM and normalized to [0, 1].
 
 **Requires `dreamerv3_pdg.py` in the same directory.**
 
@@ -378,8 +403,32 @@ mppi_cfg = MPPIConfig(
 ### File: `pdg_vjepa2.py` (alternative)
 
 Uses V-JEPA 2 (Meta FAIR) as the world model instead of DreamerV3.
-Requires video observations (rendered frames) rather than state vectors.
-Only relevant if you add a simulation renderer (AirSim / Gazebo).
+Learns to predict next latent embeddings (JEPA objective — not pixels).
+Planning is done with **CEM** (Cross-Entropy Method) in latent space.
+
+**World model modes:**
+
+| Mode | Description | Requirements |
+|------|-------------|-------------|
+| `mlp_proxy` | Lightweight MLP surrogate, CPU-friendly | No vision |
+| `lite` | V-JEPA 2 ViT-L from HuggingFace, frozen encoder + trainable head | GPU, ~4 GB VRAM |
+| `full` | jepa-wms full model | GPU, ~16 GB VRAM |
+
+**CEM algorithm:**
+
+```
+At each real timestep t:
+  1. Encode obs_t → z_t  (via encoder)
+  2. Compute z_goal from target landing state
+  3. Initialize: μ=0, σ=0.5 for H=20 action steps
+  4. For n_iterations=5:
+       a. Sample N=256 action sequences: A_k ~ N(μ, σ)
+       b. Roll each forward: z_{t+1} = predictor(z_t, a)
+       c. Score each: energy = L1(z_final, z_goal) + fuel_penalty
+       d. Select n_elite=32 lowest-energy sequences
+       e. Refit: μ = mean(elite), σ = std(elite) + 1e-6
+  5. Execute μ[0]; repeat at next step
+```
 
 ```bash
 # MLP proxy mode (no vision, CPU-friendly):
@@ -387,7 +436,7 @@ python pdg_vjepa2.py
 
 # V-JEPA 2 ViT-L from HuggingFace (GPU, ~4GB VRAM):
 pip install -U git+https://github.com/huggingface/transformers
-# Then set mode="lite" in pdg_vjepa2.py
+# Then set mode="lite" inside pdg_vjepa2.py
 ```
 
 ---
@@ -410,10 +459,11 @@ python mars_nav_uq_pipeline.py
 python dreamerv3_pdg.py
 # → dreamerv3_pdg_output.png  (~10 min on GPU, ~60 min on CPU)
 
-# Step 5: Track 2 — MPPI planner (builds on Step 4)
+# Step 5: Track 2 — MPPI planner + conformal calibration (builds on Step 4)
 # Both files must be in the same directory
 python mppi_dreamer.py
-# → mppi_dreamer_output.png  (~15 min on GPU)
+# → mppi_dreamer_output.png     B3: MPPI vs Actor (no CP)   (~20 min on GPU)
+# → mppi_dreamer_cp_output.png  B3 vs B4 conformal ablation
 ```
 
 Each step is independent — you can run Step 3 without Step 2, and Step 5
@@ -424,72 +474,81 @@ re-trains DreamerV3 internally so you do not need to run Step 4 first
 
 ## Phase Roadmap
 
-This project follows the 6-phase plan from the research document:
-
 | Phase | Description | File | Status |
 |-------|-------------|------|--------|
 | 1 | Terrain environment from DEM | `mppi_dreamer.py` → `TerrainHazardMap` | ✅ synthetic DEM; swap in real lunar/Mars DEM |
 | 2 | MPPI with analytic dynamics | `mppi_dreamer.py` → `_fallback_action` | ✅ fallback = analytic brake policy |
 | 3 | DreamerV3 world model | `dreamerv3_pdg.py` | ✅ full RSSM + actor-critic |
 | 4 | DreamerV3 + MPPI | `mppi_dreamer.py` | ✅ prior-only rollouts, terrain cost |
-| 5 | Conformal prediction | `ConformalUncertaintyHook` | 🔲 stub ready, needs calibration |
-| 6 | Evaluation + baselines | `evaluate_mppi()` | ✅ MPPI vs Actor; add CP baseline |
+| 5 | Conformal prediction | `ConformalUncertaintyHook` | ✅ split-conformal calibration on prior entropy |
+| 6 | Evaluation + baselines | `evaluate_mppi()` | ✅ B3 (no CP) + B4 (+CP) ablation |
 
 ---
 
-## Phase 5 — Adding Conformal Prediction
+## Phase 5 — Conformal Prediction (Implemented)
 
-The conformal hook is already wired into the cost function. To activate it:
+Phase 5 is fully implemented and runs automatically as part of `run()`.
 
-**Step 1 — Collect calibration episodes** (hold out full episodes, not transitions):
+**How it works:**
 
-```python
-from dreamerv3_pdg import MarsPDGEnv, PDGConfig
-from mppi_dreamer import ConformalUncertaintyHook
-import numpy as np
+The nonconformity score is the **mean categorical entropy of the RSSM prior**,
+averaged over the `stoch_dim` slots:
 
-env = MarsPDGEnv(PDGConfig())
-cal_episodes = []
-
-for i in range(200):              # 200 held-out episodes
-    obs = env.reset(seed=8000+i)
-    ep = {"obs": [], "actions": [], "rewards": [], "dones": []}
-    done = False
-    while not done:
-        action = np.random.uniform(-1, 1, 3)  # or use trained actor
-        next_obs, r, done, _ = env.step(action)
-        ep["obs"].append(obs); ep["actions"].append(action)
-        ep["rewards"].append(r); ep["dones"].append(float(done))
-        obs = next_obs
-    for k in ep: ep[k] = np.array(ep[k])
-    cal_episodes.append(ep)
+```
+s_t = H(prior_t) = -Σ_{i=1}^{stoch_dim} Σ_{c} p_{i,c} · log(p_{i,c})
 ```
 
-**Step 2 — Calibrate:**
+This score is computable at test time (no true observation needed), which makes
+it suitable for MPPI rollouts. High entropy = the prior is uncertain about the
+next latent state = the model is likely out of its training distribution.
+
+**Calibration (split conformal):**
+
+```
+q̂ = Quantile({s_t : t ∈ cal}, ceil((1-α)(1+1/n)) / (1+1/n))
+```
+
+100 held-out episodes are collected using the trained actor policy (same
+distribution as deployment), then `q̂` is set as the `(1-α)` corrected quantile.
+
+**MPPI cost penalty:**
+
+```
+c_conf(k, t) = max(0, H(prior_{k,t}) - q̂)
+```
+
+Only trajectories where the prior entropy exceeds the calibrated threshold
+incur a penalty, penalizing excursions into regions of high model uncertainty.
+
+**Running manually:**
 
 ```python
+from mppi_dreamer import (collect_calibration_episodes,
+                          ConformalUncertaintyHook, evaluate_mppi,
+                          MPPIConfig, PDGConfig)
+
+# Collect calibration data
+cal_episodes = collect_calibration_episodes(agent, PDGConfig(),
+                                            n_episodes=100, device=device)
+
+# Calibrate
 conf_hook = ConformalUncertaintyHook()
 conf_hook.calibrate(agent, cal_episodes, alpha=0.1, device=device)
-# Prints: CP calibrated: q̂ = 0.0034  (α=0.1, n=18432 calibration steps)
-```
+# → CP calibrated: q̂ = 0.xxxx  (α=0.1, n=... calibration steps)
 
-**Step 3 — Evaluate with conformal penalty:**
-
-```python
-from mppi_dreamer import evaluate_mppi, MPPIConfig, PDGConfig
-
-eval_cp = evaluate_mppi(
+# Evaluate B4 (MPPI + conformal)
+eval_b4 = evaluate_mppi(
     agent, terrain,
-    MPPIConfig(K=512, H=20, w_conf=1.0),   # enable CP penalty
+    MPPIConfig(K=512, H=20, w_conf=1.0),
     PDGConfig(),
-    n_episodes=50,
+    n_episodes=30,
     use_conf=True,
     conf_hook=conf_hook,
     device=device,
 )
 ```
 
-**Step 4 — Compare to lightning-uq-box conformal calibrator** (more rigorous):
+**Compare to lightning-uq-box** (more rigorous regression conformalizer):
 
 ```python
 from lightning_uq_box.post_hoc_conformalizers import SplitConformalClassification
@@ -548,6 +607,17 @@ terrain = TerrainHazardMap(size=dem.shape[0], resolution=30.0, dem_array=dem)
 | `safety_threshold` | 1e6 | Fallback trigger — lower = more conservative |
 | `normalize_costs` | True | Normalize before temperature — keep True |
 
+### V-JEPA 2 / CEM (`pdg_vjepa2.py`)
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `horizon` | 20 | CEM planning horizon |
+| `n_samples` | 256 | CEM candidate sequences per iteration |
+| `n_elite` | 32 | Top sequences kept for refitting Gaussian |
+| `n_iterations` | 5 | CEM refinement iterations |
+| `latent_dim` | 256 (MLP) / 1024 (ViT-L) | Embedding size |
+| `fuel_weight` | 0.02 | Fuel penalty in `plan_with_fuel_penalty()` |
+
 ---
 
 ## Baselines
@@ -559,7 +629,7 @@ The project compares four baselines. All are implemented or stubbed:
 | B1: MPPI + analytic dynamics | Set `w_conf=0, w_hazard=0` and replace RSSM with hand-coded dynamics | Does learned model add value? |
 | B2: DreamerV3 Actor only | `agent.act()` without MPPI — already in `evaluate_mppi()` | Does online planning help? |
 | B3: Dreamer + MPPI, no CP | Default `evaluate_mppi(use_conf=False)` | Main comparison point |
-| B4: Dreamer + MPPI + CP | `evaluate_mppi(use_conf=True, conf_hook=calibrated_hook)` | Main contribution |
+| B4: Dreamer + MPPI + CP | `run()` runs this automatically; or call `evaluate_mppi(use_conf=True, conf_hook=calibrated_hook)` | Main contribution |
 
 ---
 
@@ -569,7 +639,7 @@ The project compares four baselines. All are implemented or stubbed:
 All files must be in the same directory when running `mppi_dreamer.py`.
 
 ```bash
-cd mars_nav/
+cd DreamLand/
 python mppi_dreamer.py
 ```
 

@@ -1,0 +1,5 @@
+ai4mars/
+__pycache__/
+checkpoints/
+*.pth
+output/

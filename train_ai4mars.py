@@ -1,15 +1,24 @@
 """
 Fine-tune DeepLabV3+ on AI4MARS Dataset
 =========================================
-Run this AFTER downloading AI4MARS from data.nasa.gov
+Run this AFTER downloading AI4MARS from Zenodo:
+  https://zenodo.org/records/15995036
 
-Download: https://data.nasa.gov/dataset/ai4mars-a-dataset-for-terrain-aware-autonomous-driving-on-mars
-Expected structure:
-  ai4mars/
-    images/    ← rover .jpg images
-    labels/    ← .png label maps (pixel values 0-3 = soil/bedrock/sand/rock)
-    train.txt  ← list of training image IDs
-    val.txt    ← list of validation image IDs
+Supports both layout variants automatically:
+
+  Flat layout (legacy):
+    ai4mars/
+      images/    ← rover .jpg images
+      labels/    ← .png label maps (pixel values 0-3)
+      train.txt  ← optional split file
+      val.txt    ← optional split file
+
+  v0.6 nested layout (Zenodo download):
+    ai4mars/ai4mars-dataset-merged-0.6/
+      msl/mcam/images/  ← Curiosity Mastcam .JPG
+      msl/mcam/labels/train/  ← *_merged.png label maps
+      msl/ncam/images/ + labels/train/
+      m2020/images/ + labels/NAV/
 
 Usage:
   python train_ai4mars.py --data_dir ./ai4mars --epochs 30 --output ./checkpoints
@@ -37,38 +46,92 @@ class AI4MARSDataset(Dataset):
     """
     Loads AI4MARS images + segmentation label maps.
     Label values: 0=soil, 1=bedrock, 2=sand, 3=rock
+
+    Auto-detects flat layout (legacy) and v0.6 nested layout (Zenodo).
     """
     NUM_CLASSES = 4
 
     def __init__(self, data_dir: str, split: str = "train",
                  img_size: int = 512, augment: bool = True):
-        self.data_dir = Path(data_dir)
         self.img_size = img_size
-        self.augment = augment
+        self.augment  = augment
+        self.pairs    = []  # list of (img_path, lbl_path)
 
-        split_file = self.data_dir / f"{split}.txt"
-        if split_file.exists():
-            with open(split_file) as f:
-                self.ids = [l.strip() for l in f if l.strip()]
+        data_dir = Path(data_dir)
+        flat_img_dir = data_dir / "images"
+
+        if flat_img_dir.exists():
+            # ── Flat layout ──────────────────────────────────────────────
+            split_file = data_dir / f"{split}.txt"
+            if split_file.exists():
+                with open(split_file) as f:
+                    ids = [l.strip() for l in f if l.strip()]
+            else:
+                ids = [p.stem for p in flat_img_dir.glob("*.jpg")]
+                if split == "val":
+                    ids = ids[int(len(ids) * 0.9):]
+                else:
+                    ids = ids[:int(len(ids) * 0.9)]
+            lbl_dir = data_dir / "labels"
+            for stem in ids:
+                img_p = flat_img_dir / f"{stem}.jpg"
+                lbl_p = lbl_dir / f"{stem}.png"
+                if img_p.exists() and lbl_p.exists():
+                    self.pairs.append((img_p, lbl_p))
         else:
-            # Fallback: use all images in images/
-            img_dir = self.data_dir / "images"
-            self.ids = [p.stem for p in img_dir.glob("*.jpg")]
+            # ── v0.6 nested layout (Zenodo) ───────────────────────────────
+            # Scan all rover/camera combinations for image+label pairs.
+            # Labels are in labels/train/ or labels/NAV/ with suffix *_merged.png
+            # (or matching .png for m2020/NAV).  Images are .JPG or .jpg/.jpeg.
+            root = data_dir
+            # Find the unpacked top-level folder if present
+            candidates = [d for d in root.iterdir()
+                          if d.is_dir() and d.name.startswith("ai4mars-dataset")]
+            search_root = candidates[0] if candidates else root
 
-        self.img_dir = self.data_dir / "images"
-        self.lbl_dir = self.data_dir / "labels"
+            # Build label index: image_stem -> label_path
+            lbl_index: dict = {}
+            for lbl_path in search_root.rglob("*.png"):
+                # Strip known suffixes: _NNNNN_merged  or _merged
+                stem = lbl_path.stem
+                for suffix in ("_merged",):
+                    # Remove trailing _NNNNN_merged
+                    parts = stem.rsplit("_", 2)
+                    if len(parts) == 3 and parts[2] == "merged":
+                        stem = parts[0]
+                    elif len(parts) >= 2 and parts[-1] == "merged":
+                        stem = "_".join(parts[:-1])
+                lbl_index[stem] = lbl_path
+
+            # Find all images and match to labels
+            img_exts = {".jpg", ".jpeg", ".JPG", ".JPEG"}
+            all_pairs = []
+            for img_path in search_root.rglob("*"):
+                if img_path.suffix in img_exts:
+                    lbl = lbl_index.get(img_path.stem)
+                    if lbl is not None:
+                        all_pairs.append((img_path, lbl))
+
+            # Deterministic 90/10 train/val split by sorted order
+            all_pairs.sort(key=lambda p: str(p[0]))
+            n = len(all_pairs)
+            cut = int(n * 0.9)
+            if split == "val":
+                self.pairs = all_pairs[cut:]
+            else:
+                self.pairs = all_pairs[:cut]
 
         self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
-        print(f"  AI4MARS {split}: {len(self.ids)} samples")
+        print(f"  AI4MARS {split}: {len(self.pairs)} samples")
 
     def __len__(self):
-        return len(self.ids)
+        return len(self.pairs)
 
     def __getitem__(self, idx):
-        img_id = self.ids[idx]
-        img = Image.open(self.img_dir / f"{img_id}.jpg").convert("RGB")
-        lbl = Image.open(self.lbl_dir / f"{img_id}.png")
+        img_path, lbl_path = self.pairs[idx]
+        img = Image.open(img_path).convert("RGB")
+        lbl = Image.open(lbl_path)
 
         # Resize
         img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
@@ -82,14 +145,13 @@ class AI4MARSDataset(Dataset):
             if torch.rand(1) > 0.5:
                 img = TF.vflip(img)
                 lbl = TF.vflip(lbl)
-            # Random color jitter
             img = T.ColorJitter(brightness=0.3, contrast=0.3,
                                 saturation=0.2, hue=0.1)(img)
 
         img_tensor = self.normalize(T.ToTensor()(img))
         lbl_tensor = torch.from_numpy(np.array(lbl)).long()
 
-        # Clamp labels to valid range (255 = unlabeled in some AI4MARS versions)
+        # Clamp labels: 255 = unlabeled → treat as soil (0)
         lbl_tensor = lbl_tensor.clamp(0, self.NUM_CLASSES - 1)
 
         return img_tensor, lbl_tensor

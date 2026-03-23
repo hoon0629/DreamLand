@@ -296,7 +296,8 @@ class MPPICostFunction:
     def step_cost(self, decoded_obs: torch.Tensor,
                   action: torch.Tensor,
                   h: Optional[torch.Tensor] = None,
-                  z: Optional[torch.Tensor] = None) -> torch.Tensor:
+                  z: Optional[torch.Tensor] = None,
+                  prior_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Per-step cost for K rollouts at one timestep.
 
@@ -331,10 +332,9 @@ class MPPICostFunction:
         else:
             c_haz = torch.zeros_like(x)
 
-        # c_conf: conformal uncertainty penalty (placeholder)
-        # Replace with: c_conf = self.conf_fn(h, z) when CP is added
+        # c_conf: conformal uncertainty penalty
         if self.conf_fn is not None and h is not None and cfg.w_conf > 0:
-            c_conf = self.conf_fn(h, z)
+            c_conf = self.conf_fn(h, z, prior_logits)
         else:
             c_conf = torch.zeros_like(x)
 
@@ -535,7 +535,7 @@ class MPPIPlanner:
 
         for t in range(H):
             # Prior step for all K trajectories in parallel
-            h, z, _ = self.agent.rssm.step_prior(h, z, V[:, t, :])
+            h, z, prior_logits = self.agent.rssm.step_prior(h, z, V[:, t, :])
 
             # Decode latent → predicted obs
             feat         = torch.cat([h, z], -1)           # (K, latent)
@@ -547,6 +547,7 @@ class MPPIPlanner:
                 decoded_obs, V[:, t, :],
                 h=h if cfg.w_conf > 0 else None,
                 z=z if cfg.w_conf > 0 else None,
+                prior_logits=prior_logits if cfg.w_conf > 0 else None,
             )
             costs += step_c
 
@@ -603,6 +604,20 @@ class MPPIPlanner:
 # CONFORMAL PREDICTION HOOK (PLACEHOLDER)
 # ─────────────────────────────────────────────
 
+def _prior_entropy(prior_logits: torch.Tensor) -> torch.Tensor:
+    """
+    Mean categorical entropy of the RSSM prior over stoch_dim slots.
+
+    Args:
+        prior_logits: (..., stoch_dim, stoch_classes)
+
+    Returns:
+        entropy: (...) — mean entropy in nats, averaged over slots
+    """
+    probs = torch.softmax(prior_logits, dim=-1)
+    return -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean(dim=-1)
+
+
 class ConformalUncertaintyHook:
     """
     Placeholder for the conformal prediction uncertainty penalty.
@@ -637,6 +652,15 @@ class ConformalUncertaintyHook:
         """
         Calibrate the conformal threshold from held-out episodes.
 
+        Nonconformity score: mean categorical entropy of the RSSM prior,
+        H(prior) = -Σ p * log(p) averaged over stoch_dim slots.
+
+        Using prior entropy (rather than decoder reconstruction error) ensures
+        the same score is computable at test time without true observations.
+        High entropy = the prior is uncertain about the next latent state,
+        which correlates with high prediction error on out-of-distribution
+        dynamics.
+
         Args:
             agent:                trained DreamerV3 agent
             calibration_episodes: list of episode dicts (full episodes only)
@@ -648,55 +672,62 @@ class ConformalUncertaintyHook:
         scores = []
         agent.eval()
 
-        for ep in calibration_episodes:
-            obs_seq = torch.FloatTensor(ep["obs"]).to(device)    # (T, obs_dim)
-            act_seq = torch.FloatTensor(ep["actions"]).to(device) # (T, action_dim)
-            T = obs_seq.shape[0]
+        with torch.no_grad():
+            for ep in calibration_episodes:
+                obs_seq = torch.FloatTensor(ep["obs"]).to(device)     # (T, obs_dim)
+                act_seq = torch.FloatTensor(ep["actions"]).to(device)  # (T, action_dim)
+                T = obs_seq.shape[0]
 
-            h, z = agent.rssm.initial_state(1, device)
-            for t in range(T - 1):
-                embed = agent.encoder(obs_seq[t:t+1])
-                h, z, _, _ = agent.rssm.step_posterior(
-                    h, z, act_seq[t:t+1], embed)
+                h, z = agent.rssm.initial_state(1, device)
+                for t in range(T - 1):
+                    # Advance state with posterior (sees true obs)
+                    embed = agent.encoder(obs_seq[t:t+1])
+                    h, z, _, _ = agent.rssm.step_posterior(
+                        h, z, act_seq[t:t+1], embed)
 
-                # Predict next obs from prior step
-                h_prior, z_prior, _ = agent.rssm.step_prior(h, z, act_seq[t:t+1])
-                feat     = torch.cat([h_prior, z_prior], -1)
-                obs_pred = symexp(agent.decoder(feat).mean)
-
-                # Nonconformity score: L2 prediction error (normalized)
-                true_next = obs_seq[t+1:t+2]
-                score = F.mse_loss(obs_pred, symlog(true_next)).item()
-                scores.append(score)
+                    # Prior distribution at next step (no true obs needed)
+                    _, _, prior_logits = agent.rssm.step_prior(
+                        h, z, act_seq[t:t+1])
+                    # prior_logits: (1, stoch_dim, stoch_classes)
+                    score = _prior_entropy(prior_logits).item()
+                    scores.append(score)
 
         # Split conformal quantile (corrected for finite calibration set)
         n     = len(scores)
         level = np.ceil((1 - alpha) * (1 + 1/n)) / (1 + 1/n)
-        level = np.clip(level, 0, 1)
+        level = float(np.clip(level, 0, 1))
         self.q_hat   = float(np.quantile(scores, level))
         self.enabled = True
         print(f"  CP calibrated: q̂ = {self.q_hat:.6f}  "
-              f"(α={alpha}, n={n} calibration steps)")
+              f"(α={alpha}, n={n} calibration steps, "
+              f"score range [{min(scores):.4f}, {max(scores):.4f}])")
 
-    def __call__(self, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    def __call__(self, h: torch.Tensor, z: torch.Tensor,
+                 prior_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Compute conformal uncertainty penalty for K latent states.
 
+        Uses the same nonconformity score as calibrate(): mean categorical
+        entropy of the prior distribution. The penalty is max(0, H - q̂),
+        so only trajectories where the model is anomalously uncertain
+        (entropy exceeds the calibrated threshold) incur a cost.
+
         Args:
-            h: (K, deter_dim)
-            z: (K, stoch_flat)
+            h:            (K, deter_dim)
+            z:            (K, stoch_flat)
+            prior_logits: (K, stoch_dim, stoch_classes) from step_prior
 
         Returns:
             penalty: (K,) tensor ∈ [0, ∞)
         """
         if not self.enabled:
             return torch.zeros(h.shape[0], device=h.device)
-        # Placeholder: use KL-like spread of z as proxy uncertainty.
-        # Replace with calibrated conformal score in Phase 5.
-        z_reshaped = z.reshape(z.shape[0], -1)
-        uncertainty = z_reshaped.var(dim=-1)  # (K,)
-        penalty = torch.clamp(uncertainty - self.q_hat, min=0)
-        return penalty
+        if prior_logits is not None:
+            entropy = _prior_entropy(prior_logits)          # (K,)
+        else:
+            # Fallback when logits not available: use z variance as proxy
+            entropy = z.reshape(z.shape[0], -1).var(dim=-1)
+        return torch.clamp(entropy - self.q_hat, min=0)
 
 
 # ─────────────────────────────────────────────
@@ -961,19 +992,184 @@ def plot_comparison(eval_out: dict, pdg_cfg: PDGConfig, save_path: str = None):
     plt.show()
 
 
+def plot_comparison_cp(eval_b3: dict, eval_b4: dict, pdg_cfg: PDGConfig,
+                       save_path: str = None):
+    """
+    8-panel B3 (no CP) vs B4 (with conformal) comparison plot.
+
+    Left 4 columns: B3 metrics. Right 4 columns: B4 metrics.
+    Bottom row: side-by-side summary comparing all four conditions
+    (MPPI-B3, MPPI-B4, Actor-B3, Actor-B4).
+    """
+    terrain  = eval_b3["terrain"]
+    b3_mppi  = eval_b3["mppi"]["results"]
+    b3_actor = eval_b3["actor"]["results"]
+    b3_mt    = eval_b3["mppi"]["trajectories"]
+    b4_mppi  = eval_b4["mppi"]["results"]
+    b4_actor = eval_b4["actor"]["results"]
+    b4_mt    = eval_b4["mppi"]["trajectories"]
+
+    fig = plt.figure(figsize=(28, 12))
+    fig.patch.set_facecolor("#0d1117")
+    gs  = gridspec.GridSpec(2, 4, figure=fig, hspace=0.45, wspace=0.32)
+
+    def sax(pos):
+        ax = fig.add_subplot(pos, facecolor="#161b22")
+        for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
+        ax.tick_params(colors="#8b949e", labelsize=8)
+        ax.xaxis.label.set_color("#8b949e")
+        ax.yaxis.label.set_color("#8b949e")
+        return ax
+
+    ext = terrain.extent
+
+    def _scatter(ax, results, trajs, title):
+        ax.imshow(terrain.hazard_map, cmap="RdYlGn_r", vmin=0, vmax=1,
+                  extent=[-ext, ext, -ext, ext], origin="lower", alpha=0.55)
+        for traj, res in zip(trajs[:12], results[:12]):
+            ax.plot(traj[:, 0], traj[:, 1],
+                    color="#00ff88" if res["success"] else "#ff6b6b",
+                    alpha=0.55, lw=1.0)
+        ax.plot(0, 0, "*", color="#ffff00", markersize=12, zorder=5)
+        ax.set_title(title, color="white", fontsize=9)
+        ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+
+    # ── Row 0: footprint maps
+    _scatter(sax(gs[0, 0]), b3_mppi, b3_mt,    "B3 MPPI  (no CP)")
+    _scatter(sax(gs[0, 1]), b4_mppi, b4_mt,    "B4 MPPI  (+ conformal)")
+
+    # ── Hazard histograms: B3 vs B4 MPPI
+    ax_haz = sax(gs[0, 2])
+    ax_haz.hist([r["hazard_td"] for r in b3_mppi], bins=12,
+                color="#00d4ff", alpha=0.7, label="B3 (no CP)")
+    ax_haz.hist([r["hazard_td"] for r in b4_mppi], bins=12,
+                color="#b0ff8c", alpha=0.7, label="B4 (+CP)")
+    ax_haz.set_title("MPPI Hazard at Touchdown\n(lower = safer)",
+                      color="white", fontsize=9)
+    ax_haz.set_xlabel("Hazard Score")
+    ax_haz.legend(fontsize=8, facecolor="#161b22", labelcolor="white",
+                  edgecolor="#30363d")
+
+    # ── Landing scatter: B4 MPPI
+    ax_sc = sax(gs[0, 3])
+    for r, traj in zip(b4_mppi, b4_mt):
+        fx, fy = traj[-1, 0], traj[-1, 1]
+        ax_sc.scatter(fx, fy, color="#00ff88" if r["success"] else "#ff6b6b",
+                      s=28, alpha=0.8, zorder=3)
+    ax_sc.add_patch(plt.Circle((0, 0), pdg_cfg.pos_tol, color="#ffff00",
+                                fill=False, lw=1.5, ls="--"))
+    ax_sc.set_aspect("equal")
+    ax_sc.set_title("B4 Landing Scatter", color="white", fontsize=9)
+    ax_sc.set_xlabel("X err (m)"); ax_sc.set_ylabel("Y err (m)")
+
+    # ── Row 1: 4-condition bar chart (full width)
+    ax_bar = sax(gs[1, :])
+    conditions = ["MPPI\n(B3 no CP)", "MPPI\n(B4 +CP)", "Actor\n(B3)", "Actor\n(B4 +CP)"]
+    colors     = ["#00d4ff", "#b0ff8c", "#ffd93d", "#ffb347"]
+
+    def _stat(results):
+        succ = 100 * np.mean([r["success"] for r in results])
+        haz  = 100 * np.mean([r["hazard_td"] for r in results])
+        fb   = sum(r.get("n_fallback", 0) for r in results)
+        return succ, haz, fb
+
+    stats = [_stat(b3_mppi), _stat(b4_mppi), _stat(b3_actor), _stat(b4_actor)]
+    metric_names = ["Success (%)", "Avg Hazard (×100)", "Fallbacks"]
+    x_ = np.arange(len(metric_names))
+    width = 0.18
+    for i, (cond, color, stat) in enumerate(zip(conditions, colors, stats)):
+        ax_bar.bar(x_ + (i - 1.5) * width, stat, width,
+                   color=color, alpha=0.85, label=cond)
+    ax_bar.set_xticks(x_)
+    ax_bar.set_xticklabels(metric_names, color="#8b949e", fontsize=10)
+    ax_bar.set_title("Summary: B3 (no CP) vs B4 (+conformal)  |  All conditions",
+                      color="white", fontsize=10)
+    ax_bar.legend(fontsize=8, facecolor="#161b22", labelcolor="white",
+                  edgecolor="#30363d", ncol=4)
+
+    plt.suptitle(
+        "DreamerV3 + MPPI  |  Conformal Prediction Ablation  |  Mars PDG",
+        color="white", fontsize=13, fontweight="bold")
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        print(f"  Saved → {save_path}")
+    plt.show()
+
+
 # ─────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────
 
+def collect_calibration_episodes(agent: DreamerV3, pdg_cfg: PDGConfig,
+                                  n_episodes: int = 100,
+                                  device: str = "cpu",
+                                  seed_offset: int = 8000) -> list:
+    """
+    Collect held-out episodes using the trained agent actor for CP calibration.
+
+    Uses the actor policy (not random) so the score distribution matches
+    the deployment distribution.
+
+    Args:
+        agent:       trained DreamerV3 agent
+        pdg_cfg:     PDG environment config
+        n_episodes:  number of calibration episodes (100 is usually enough)
+        device:      torch device
+        seed_offset: seed base (offset from training seeds to avoid leakage)
+
+    Returns:
+        list of episode dicts with keys: obs, actions, rewards, dones
+    """
+    env = MarsPDGEnv(pdg_cfg)
+    episodes = []
+    agent.eval()
+
+    for i in range(n_episodes):
+        obs = env.reset(seed=seed_offset + i)
+        ep = {"obs": [], "actions": [], "rewards": [], "dones": []}
+        h, z = agent.rssm.initial_state(1, device)
+        done = False
+
+        while not done:
+            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
+            with torch.no_grad():
+                embed = agent.encoder(obs_t)
+                a_prev = torch.zeros(1, pdg_cfg.action_dim, device=device)
+                h, z, _, _ = agent.rssm.step_posterior(h, z, a_prev, embed)
+                action = agent.act(obs_t, h, z).cpu().numpy()[0]
+
+            next_obs, reward, done, _ = env.step(action)
+            ep["obs"].append(obs)
+            ep["actions"].append(action)
+            ep["rewards"].append(reward)
+            ep["dones"].append(float(done))
+            obs = next_obs
+
+        for k in ep:
+            ep[k] = np.array(ep[k])
+        episodes.append(ep)
+
+        if (i + 1) % 20 == 0:
+            print(f"  Collected {i+1}/{n_episodes} calibration episodes")
+
+    return episodes
+
+
 def run(n_train_steps: int = 50_000,
+        n_cal_episodes: int = 100,
         n_eval_episodes: int = 30,
+        alpha: float = 0.1,
         device: str = None):
     """
     Full pipeline:
       1. Train DreamerV3 world model
       2. Build terrain hazard map
-      3. Evaluate MPPI vs Actor baseline
-      4. (Optional) Calibrate and enable conformal hook
+      3. B3: Evaluate MPPI + Actor (no conformal)
+      4. Calibrate conformal hook on held-out episodes
+      5. B4: Evaluate MPPI + Actor with conformal penalty
+      6. Plot combined B3 vs B4 comparison
     """
     from dreamerv3_pdg import train_dreamerv3
 
@@ -981,7 +1177,7 @@ def run(n_train_steps: int = 50_000,
     pdg_cfg = PDGConfig()
 
     print("=" * 60)
-    print("  Phase 1: Train DreamerV3 world model")
+    print("  Phase 1-3: Train DreamerV3 world model")
     print("=" * 60)
     agent, _, _ = train_dreamerv3(
         n_env_steps=n_train_steps,
@@ -993,7 +1189,7 @@ def run(n_train_steps: int = 50_000,
     agent.eval()
 
     print("\n" + "=" * 60)
-    print("  Phase 2: Build terrain hazard map")
+    print("  Phase 4: Build terrain hazard map")
     print("=" * 60)
     terrain = TerrainHazardMap(size=200, resolution=5.0, seed=42)
     print(f"  Terrain: {terrain.size}×{terrain.size} cells, "
@@ -1003,49 +1199,59 @@ def run(n_train_steps: int = 50_000,
           f"{terrain.hazard_map.max():.3f}]")
 
     print("\n" + "=" * 60)
-    print("  Phase 3: MPPI evaluation")
+    print("  Phase 5 (B3): MPPI evaluation — no conformal")
     print("=" * 60)
-    mppi_cfg = MPPIConfig(K=512, H=20, temperature=0.05,
-                          w_hazard=2.0, w_conf=0.0)
-
-    eval_out = evaluate_mppi(
-        agent, terrain, mppi_cfg, pdg_cfg,
+    mppi_cfg_b3 = MPPIConfig(K=512, H=20, temperature=0.05,
+                              w_hazard=2.0, w_conf=0.0)
+    eval_b3 = evaluate_mppi(
+        agent, terrain, mppi_cfg_b3, pdg_cfg,
         n_episodes=n_eval_episodes,
         use_conf=False,
         device=device,
     )
-
-    plot_comparison(eval_out, pdg_cfg,
+    plot_comparison(eval_b3, pdg_cfg,
                     save_path="mppi_dreamer_output.png")
 
-    # ── Phase 4 hook (fill in when CP is ready)
     print("\n" + "=" * 60)
-    print("  Phase 4 (placeholder): Conformal calibration")
+    print("  Phase 5: Conformal calibration")
     print("=" * 60)
-    conf_hook = ConformalUncertaintyHook()
-    print("  CP hook created (not yet calibrated).")
-    print("  To calibrate: conf_hook.calibrate(agent, cal_episodes, alpha=0.1)")
-    print("  Then: run evaluate_mppi(..., use_conf=True, conf_hook=conf_hook)")
+    print(f"  Collecting {n_cal_episodes} calibration episodes...")
+    cal_episodes = collect_calibration_episodes(
+        agent, pdg_cfg, n_episodes=n_cal_episodes, device=device)
 
-    return agent, terrain, eval_out, conf_hook
+    conf_hook = ConformalUncertaintyHook()
+    conf_hook.calibrate(agent, cal_episodes, alpha=alpha, device=device)
+
+    print("\n" + "=" * 60)
+    print("  Phase 6 (B4): MPPI evaluation — with conformal")
+    print("=" * 60)
+    mppi_cfg_b4 = MPPIConfig(K=512, H=20, temperature=0.05,
+                              w_hazard=2.0, w_conf=1.0)
+    eval_b4 = evaluate_mppi(
+        agent, terrain, mppi_cfg_b4, pdg_cfg,
+        n_episodes=n_eval_episodes,
+        use_conf=True,
+        conf_hook=conf_hook,
+        device=device,
+    )
+    plot_comparison_cp(eval_b3, eval_b4, pdg_cfg,
+                       save_path="mppi_dreamer_cp_output.png")
+
+    return agent, terrain, eval_b3, eval_b4, conf_hook
 
 
 if __name__ == "__main__":
     """
-    Quick start:
+    Quick start (full pipeline including conformal):
         python mppi_dreamer.py
 
-    With conformal (after training):
-        agent, terrain, eval_out, conf_hook = run()
-        conf_hook.calibrate(agent, cal_episodes)
-        eval_out_cp = evaluate_mppi(
-            agent, terrain, MPPIConfig(w_conf=1.0), PDGConfig(),
-            use_conf=True, conf_hook=conf_hook,
-        )
+    Outputs:
+        mppi_dreamer_output.png    — B3: MPPI vs Actor (no CP)
+        mppi_dreamer_cp_output.png — B3 vs B4 conformal ablation
 
     Tune MPPI:
         MPPIConfig(K=1024, H=25, temperature=0.03)   # more samples, longer horizon
         MPPIConfig(w_hazard=5.0)                      # more hazard-averse
         MPPIConfig(safety_threshold=500.0)            # trigger fallback sooner
     """
-    run(n_train_steps=50_000, n_eval_episodes=20)
+    run(n_train_steps=50_000, n_cal_episodes=100, n_eval_episodes=20, alpha=0.1)
