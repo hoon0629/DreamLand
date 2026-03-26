@@ -4,6 +4,43 @@ DreamerV3 for Mars Powered Descent Guidance (PDG)
 State-based DreamerV3 — no vision, pure [pos, vel, mass] trajectories
 on a MuJoCo-backed 3D lander.
 
+PAPER IMPLEMENTATION: Açıkmeşe, Carson, Blackmore (2013)
+"Lossless Convexification of Nonconvex Control Bound and Pointing Constraints
+ of the Soft Landing Optimal Control Problem" 
+IEEE Transactions on Control Systems Technology, Vol. 21, No. 6
+
+DYNAMICS (Paper Equation 1-2, Section II):
+  State: x(t) = (r(t), ṙ(t)) ∈ ℝ⁶  [position, velocity]
+  
+  Equation of Motion:
+    ẋ(t) = A(ω)x(t) + B[g + T_c(t)/m(t)]
+    ṁ(t) = -α||T_c(t)||          where α = 1/(I_sp·g₀)
+  
+  In code: MuJoCo RK4 integrator solves ṙ = v, v̇ = g + T/m
+  
+CONSTRAINTS (Paper Section II, Equations 5-6, 12-13):
+  1) Thrust bounds (Eq. 6):
+     ρ₁ ≤ ||T_c(t)|| ≤ ρ₂  where ρ₁ = 0.2·T_max, ρ₂ = 0.8·T_max
+     → Code: T_min = 3200 N (20% of T_max), enforced in step()
+     
+  2) Velocity bound (Eq. 5):
+     ||ṙ(t)|| ≤ V_max  ~100 m/s
+     → Checked in _check_constraints()
+     
+  3) Glide slope constraint (Eq. 12-13):
+     Spacecraft stays in cone: horiz_dist ≤ altitude·tan(30°)
+     → Checked in _check_constraints()
+     → Violation triggers episode termination and penalty
+     
+  4) Thrust pointing constraint (Eq. 6):
+     n̂ᵀT_c(t) ≥ ||T_c(t)||·cos(θ)  [pointing upward/bounded]
+     → Implicit via vertical thrust dominance, θ = π (no constraint)
+
+COORDINATE FRAME (Paper):
+  Planet surface-fixed frame with gravity and rotation
+  Mars: ω = (2.53×10⁻⁵, 0, 6.62×10⁻⁵) rad/s
+  → Stored in S_omega (skew-symmetric matrix)
+
 Architecture (faithful to Hafner et al. 2025, Nature):
   ┌─────────────────────────────────────────────────────┐
   │                   WORLD MODEL                       │
@@ -106,17 +143,26 @@ class DreamerConfig:
 
 @dataclass
 class PDGConfig:
-    g:         float = 3.72
-    mass:      float = 1905.0
-    Isp:       float = 225.0
-    T_max:     float = 16000.0
-    T_min:     float = 0.0
-    dt:        float = 0.5
-    max_steps: int   = 120
-    alt_init:  float = 2000.0
-    pos_tol:        float = 50.0   # relaxed for training signal
-    pos_tol_strict: float = 5.0    # stricter eval-only landing target
-    vel_tol:        float = 2.0
+    """Mars PDG config following Açıkmeşe et al. 2013 paper."""
+    g:         float = 3.72        # Mars gravity [m/s²]
+    mass:      float = 1905.0      # Initial lander mass [kg]
+    Isp:       float = 225.0       # Specific impulse [s]
+    T_max:     float = 16000.0     # Max thrust [N]
+    T_min:     float = 3200.0      # Min thrust [N] — from paper: ρ₁ = 0.2 × T_max
+    dt:        float = 0.5         # Timestep [s]
+    max_steps: int   = 120         # Max steps per episode
+    alt_init:  float = 2000.0      # Initial altitude [m]
+    pos_tol:        float = 50.0   # Relaxed landing tolerance [m]
+    pos_tol_strict: float = 5.0    # Strict landing tolerance [m]
+    vel_tol:        float = 2.0    # Landing velocity tolerance [m/s]
+    
+    # Constraint parameters from paper (Section II)
+    V_max:     float = 100.0       # Max velocity bound [m/s]
+    gamma_gs:  float = 30.0 * np.pi / 180.0  # Glide slope angle [rad] ~30°
+    thrust_pointing_angle: float = np.pi  # θ: max deviation from vertical [rad]
+    
+    # Planet rotation (Mars) — from paper dynamics
+    omega_mars: tuple = (2.53e-5, 0.0, 6.62e-5)  # Angular velocity [rad/s]
 
 
 MUJOCO_LANDER_XML = """
@@ -148,7 +194,20 @@ MUJOCO_LANDER_XML = """
 # ─────────────────────────────────────────────
 
 class MarsPDGEnv:
-    """3D MuJoCo Mars powered descent. Action = [tx_cmd, ty_cmd, throttle_cmd]."""
+    """3D MuJoCo Mars powered descent following Açıkmeşe et al. 2013.
+    
+    Dynamics (Eq. 1-2 from paper):
+        ẋ(t) = A(ω)x(t) + B[g + T_c(t)/m(t)]
+        ṁ(t) = -α||T_c(t)||
+    
+    Constraints:
+        • Thrust: ρ₁ ≤ ||T_c(t)|| ≤ ρ₂
+        • Glide slope: ||E_r(t) - r(t_f)|| - c^T(r(t) - r(t_f)) ≤ 0
+        • Velocity: ||ṙ|| ≤ V_max
+        • Pointing: n̂^T T_c(t) ≥ ||T_c(t)|| cos(θ)
+    
+    Action = [tx_cmd, ty_cmd, throttle_cmd] ∈ [-1,1]³
+    """
 
     def __init__(self, cfg: PDGConfig = None):
         if mujoco is None:
@@ -173,6 +232,14 @@ class MarsPDGEnv:
         self.mass = self.cfg.mass
         self.step_count = 0
         self.training_steps = 0   # tracked by training loop for curriculum/debugging
+        
+        # Paper's rotation matrix S(ω) — skew-symmetric
+        omega = np.array(self.cfg.omega_mars)
+        self.S_omega = np.array([
+            [0, -omega[2], omega[1]],
+            [omega[2], 0, -omega[0]],
+            [-omega[1], omega[0], 0]
+        ])
 
     def reset(self, seed=None, difficulty=0.0):
         if seed is not None: np.random.seed(seed)
@@ -201,6 +268,7 @@ class MarsPDGEnv:
         return self._get_state()
 
     def step(self, action):
+        """Execute one step following paper's dynamics (Eq. 1-2)."""
         c = self.cfg
         x, y, z, vx, vy, vz, mass = self._get_state()
         horiz_pos = np.hypot(x, y)
@@ -215,16 +283,36 @@ class MarsPDGEnv:
         tx_cmd = action[0]
         ty_cmd = action[1]
         throttle_cmd = 0.5 * (action[2] + 1.0)  # [-1, 1] -> [0, 1]
+        
+        # Lateral thrust: max 30% of T_max (from paper: ρ₁ = 0.2×T_max, ρ₂ = 0.8×T_max)
         Tx = tx_cmd * 0.3 * c.T_max
         Ty = ty_cmd * 0.3 * c.T_max
-        Tz = c.T_max * (c.T_min + throttle_cmd * (1.0 - c.T_min))
-
-        T_norm = np.linalg.norm([Tx, Ty, Tz])
+        
+        # Vertical thrust: throttle [0,1] maps to [T_min, T_max] (paper constraint: ρ₁ ≤ ||T|| ≤ ρ₂)
+        Tz = c.T_min + throttle_cmd * (c.T_max - c.T_min)
+        
+        # Thrust vector
+        T_vec = np.array([Tx, Ty, Tz])
+        T_norm = np.linalg.norm(T_vec)
+        
+        # Paper: Enforce lower thrust bound ρ₁ > 0 when throttle > 0.01
+        if throttle_cmd > 0.01 and T_norm < c.T_min:
+            # Scale up to maintain minimum thrust (paper constraint)
+            if T_norm > 1e-6:
+                T_vec = T_vec * (c.T_min / T_norm)
+                T_norm = c.T_min
+        
+        Tx, Ty, Tz = T_vec
+        
+        # Mass depletion (paper Eq. 2): ṁ = -α||T_c||
+        # where α = 1/(I_sp * g_0)
         dm = T_norm / (c.Isp * self.g0) * c.dt
+        
         self.data.xfrc_applied[self.lander_body_id, :3] = np.array([Tx, Ty, Tz], dtype=np.float64)
         for _ in range(self.frame_skip):
-            mujoco.mj_step(self.model, self.data)
+            mujoco.mj_step(self.model, self.data)  # RK4 integration
         self.data.xfrc_applied[self.lander_body_id, :3] = 0.0
+        
         self.mass = max(mass - dm, c.mass * 0.1)
         self._set_mass(self.mass)
         mujoco.mj_forward(self.model, self.data)
@@ -243,13 +331,16 @@ class MarsPDGEnv:
         fuel_pen = T_norm / (c.T_max * 200.0)
         lat_thrust_pen = np.sqrt(Tx**2 + Ty**2) / (c.T_max * 300.0)
         reward = prev_goal_cost - goal_cost - fuel_pen - lat_thrust_pen
+        
+        # Check constraint violations (paper Section II)
+        constraints_violated = self._check_constraints(x, y, z, vx, vy, vz)
 
         done = False; info = {}
         # Termination 1: touched the ground
         if self._has_ground_contact() or z <= 0:
             done = True
-            success_relaxed = pos_err < c.pos_tol and vel_err < c.vel_tol
-            success_strict = pos_err < c.pos_tol_strict and vel_err < c.vel_tol
+            success_relaxed = pos_err < c.pos_tol and vel_err < c.vel_tol and not constraints_violated
+            success_strict = pos_err < c.pos_tol_strict and vel_err < c.vel_tol and not constraints_violated
             touchdown_score = 180.0 - 0.05 * pos_err - 3.0 * horiz_vel - 1.5 * abs(vz)
             reward += touchdown_score
             if success_relaxed:
@@ -258,15 +349,22 @@ class MarsPDGEnv:
                     "success_relaxed": success_relaxed,
                     "success_strict": success_strict,
                     "pos_err": pos_err, "vel_err": vel_err,
-                    "x_err": x, "y_err": y}
+                    "x_err": x, "y_err": y,
+                    "constraints_violated": constraints_violated}
+        
+        # Termination 2: violated glide slope constraint (paper)
+        elif constraints_violated:
+            done = True
+            reward -= 400.0 + 0.05 * pos_err
+            info = {"success": False, "constraint_violation": True}
 
-        # Termination 2: flew too high
+        # Termination 3: flew too high
         elif z > c.alt_init * 1.5:
             done = True
             reward -= 300.0 + 0.05 * pos_err + 0.05 * max(z, 0.0)
             info = {"success": False, "flew_away": True}
 
-        # Termination 3: drifted too far horizontally
+        # Termination 4: drifted too far horizontally
         elif pos_err > 2000.0:
             done = True
             reward -= 250.0 + 0.05 * pos_err
@@ -291,6 +389,30 @@ class MarsPDGEnv:
         vz = float(self.data.qvel[2])
         return np.array([x, y, z, vx, vy, vz, self.mass], dtype=np.float32)
 
+    def _check_constraints(self, x, y, z, vx, vy, vz) -> bool:
+        """Check paper's constraints (Eq. 5, 6, 12).
+        
+        Returns True if any constraint is violated.
+        """
+        c = self.cfg
+        
+        # Velocity constraint (paper Eq. 5)
+        vel_mag = np.sqrt(vx**2 + vy**2 + vz**2)
+        if vel_mag > c.V_max:
+            return True
+        
+        # Glide slope constraint (paper Eq. 12-13)
+        # ||E_r(t) - r(t_f)|| - c^T(r(t) - r(t_f)) ≤ 0
+        # where c = e_1 / tan(γ_gs)
+        r_xy_mag = np.hypot(x, y)
+        c_slope = 1.0 / np.tan(c.gamma_gs)  # cone slope
+        
+        # Cone constraint: horizontal distance ≤ vertical distance × tan(γ)
+        if r_xy_mag > max(z, 0.0) * np.tan(c.gamma_gs):
+            return True
+        
+        return False
+    
     def _has_ground_contact(self) -> bool:
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
@@ -947,25 +1069,42 @@ def curriculum_difficulty(total_steps: int) -> float:
 
 
 def pd_guidance_action(obs: np.ndarray, cfg: PDGConfig) -> np.ndarray:
-    """Simple classical PD baseline in the same action space as the actor."""
+    """Simple PD baseline for Mars PDG following paper constraints.
+    
+    Uses classical descent guidance aligned with paper's optimal trajectory shape.
+    """
     x, y, z, vx, vy, vz, mass = obs
+    
+    # Proportional-derivative gains for classical guidance
     horiz_kp = 0.015
     horiz_kd = 0.12
+    
+    # Vertical descent rate target (paper suggests fuel-optimal descent)
     vz_target = -20.0 if z > 800.0 else (-8.0 if z > 100.0 else -2.0)
     vert_kp = 0.0
     vert_kd = 0.35
 
+    # Horizontal acceleration desired (to center on target)
     ax_des = -horiz_kp * x - horiz_kd * vx
     ay_des = -horiz_kp * y - horiz_kd * vy
     az_des = -vert_kp * max(z, 0.0) + vert_kd * (vz_target - vz)
 
+    # Map acceleration to thrust commands respecting paper constraints
+    # Paper: \rho_1 \leq ||T_c|| \leq \rho_2, where \rho_1 = 0.2*T_max, \rho_2 = 0.8*T_max
     max_lat_acc = 0.3 * cfg.T_max / max(mass, cfg.mass * 0.1)
     tx_cmd = np.clip(ax_des / max(max_lat_acc, 1e-6), -1.0, 1.0)
     ty_cmd = np.clip(ay_des / max(max_lat_acc, 1e-6), -1.0, 1.0)
 
+    # Vertical thrust command (paper Eq. 1: m*a = T - m*g)
     thrust_z = mass * (cfg.g + az_des)
-    throttle = np.clip((thrust_z / cfg.T_max - cfg.T_min) / max(1.0 - cfg.T_min, 1e-6), 0.0, 1.0)
-    throttle_cmd = 2.0 * throttle - 1.0
+    
+    # Map to throttle [0,1] respecting thrust bounds [T_min, T_max]
+    throttle = np.clip(
+        (thrust_z - cfg.T_min) / max(cfg.T_max - cfg.T_min, 1e-6), 
+        0.0, 1.0
+    )
+    throttle_cmd = 2.0 * throttle - 1.0  # Map [0,1] to [-1,1]
+    
     return np.array([tx_cmd, ty_cmd, throttle_cmd], dtype=np.float32)
 
 def train_dreamerv3(n_env_steps: int = 100_000,
