@@ -1,7 +1,8 @@
 """
 DreamerV3 for Mars Powered Descent Guidance (PDG)
 ===================================================
-State-based DreamerV3 — no vision, pure [pos, vel, mass] trajectories.
+State-based DreamerV3 — no vision, pure [pos, vel, mass] trajectories
+on a MuJoCo-backed 3D lander.
 
 Architecture (faithful to Hafner et al. 2025, Nature):
   ┌─────────────────────────────────────────────────────┐
@@ -36,7 +37,7 @@ Key DreamerV3 innovations used here:
   - RMSNorm + SiLU throughout
 
 Install:
-  pip install torch numpy matplotlib scipy gymnasium
+  pip install torch numpy matplotlib scipy gymnasium mujoco
 
 Reference: github.com/danijar/dreamerv3 (JAX original)
            github.com/NM512/dreamerv3-torch (PyTorch port)
@@ -46,6 +47,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    import mujoco
+except ImportError:
+    mujoco = None
 from torch.distributions import OneHotCategorical, Normal, Bernoulli
 from collections import deque
 import random
@@ -65,8 +70,8 @@ warnings.filterwarnings("ignore")
 @dataclass
 class DreamerConfig:
     # World model
-    obs_dim:       int   = 5       # [x, z, vx, vz, mass]
-    action_dim:    int   = 2       # [Tx, Tz] normalized
+    obs_dim:       int   = 7       # [x, y, z, vx, vy, vz, mass]
+    action_dim:    int   = 3       # [tx_cmd, ty_cmd, throttle_cmd] in [-1, 1]
     embed_dim:     int   = 256     # encoder output dim
     deter_dim:     int   = 512     # GRU hidden (deterministic state h)
     stoch_dim:     int   = 32      # stochastic state z: stoch_dim categories
@@ -105,13 +110,37 @@ class PDGConfig:
     mass:      float = 1905.0
     Isp:       float = 225.0
     T_max:     float = 16000.0
-    T_min:     float = 0.2
+    T_min:     float = 0.0
     dt:        float = 0.5
-    max_steps: int   = 200
+    max_steps: int   = 120
     alt_init:  float = 2000.0
     pos_tol:        float = 50.0   # relaxed for training signal
-    pos_tol_strict: float = 5.0   # reported in eval only
+    pos_tol_strict: float = 5.0    # stricter eval-only landing target
     vel_tol:        float = 2.0
+
+
+MUJOCO_LANDER_XML = """
+<mujoco model="mars_pdg_lander">
+  <compiler angle="radian"/>
+  <option timestep="0.02" gravity="0 0 -3.72" integrator="RK4"/>
+  <size nuserdata="1"/>
+  <visual>
+    <map znear="0.01"/>
+  </visual>
+  <worldbody>
+    <light pos="0 0 10" dir="0 0 -1"/>
+    <geom name="ground" type="plane" pos="0 0 0" size="5000 5000 0.1"
+          rgba="0.3 0.25 0.2 1" friction="1.0 0.1 0.1"/>
+    <body name="lander" pos="0 0 0">
+      <joint name="x" type="slide" axis="1 0 0" damping="0.2"/>
+      <joint name="y" type="slide" axis="0 1 0" damping="0.2"/>
+      <joint name="z" type="slide" axis="0 0 1" damping="0.2"/>
+      <geom name="lander_geom" type="sphere" size="0.5" mass="1905"
+            rgba="0.8 0.3 0.2 1"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
 
 
 # ─────────────────────────────────────────────
@@ -119,90 +148,156 @@ class PDGConfig:
 # ─────────────────────────────────────────────
 
 class MarsPDGEnv:
-    """2D Mars powered descent. State = [x, z, vx, vz, mass]."""
+    """3D MuJoCo Mars powered descent. Action = [tx_cmd, ty_cmd, throttle_cmd]."""
 
     def __init__(self, cfg: PDGConfig = None):
+        if mujoco is None:
+            raise ImportError(
+                "MuJoCo is required for MarsPDGEnv. Install with `pip install mujoco`."
+            )
         self.cfg = cfg or PDGConfig()
+        self.model = mujoco.MjModel.from_xml_string(MUJOCO_LANDER_XML)
+        self.data = mujoco.MjData(self.model)
+        self.lander_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "lander"
+        )
+        self.lander_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "lander_geom"
+        )
+        self.ground_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "ground"
+        )
+        self.lander_radius = float(self.model.geom_size[self.lander_geom_id][0])
+        self.frame_skip = max(1, int(round(self.cfg.dt / self.model.opt.timestep)))
         self.g0 = 9.81
-        self.state = None
+        self.mass = self.cfg.mass
         self.step_count = 0
-        self.training_steps = 0   # set by training loop for phase-based reward
+        self.training_steps = 0   # tracked by training loop for curriculum/debugging
 
     def reset(self, seed=None, difficulty=0.0):
         if seed is not None: np.random.seed(seed)
         c = self.cfg
-        d = difficulty
-        vz_max = -5.0 - 75.0 * d   # difficulty=0: vz=-5 (slow), difficulty=1: vz=-80 (fast)
-        self.state = np.array([
-            np.random.uniform(-200, 200) * d,
-            c.alt_init + np.random.uniform(-100, 100) * d,
-            np.random.uniform(-30, 30) * d,
-            np.random.uniform(vz_max, vz_max * 0.25),
-            c.mass * np.random.uniform(0.5, 0.8),
-        ], dtype=np.float32)
+        d = float(np.clip(difficulty, 0.0, 1.0))
+        x_range = 50.0 + 150.0 * d
+        y_range = 50.0 + 150.0 * d
+        z_range = 30.0 + 70.0 * d
+        vx_range = 5.0 + 25.0 * d
+        vy_range = 5.0 + 25.0 * d
+        vz_low = -10.0 - 70.0 * d
+        vz_high = -3.0 - 17.0 * d
+        x = np.random.uniform(-x_range, x_range)
+        y = np.random.uniform(-y_range, y_range)
+        z = c.alt_init + np.random.uniform(-z_range, z_range)
+        vx = np.random.uniform(-vx_range, vx_range)
+        vy = np.random.uniform(-vy_range, vy_range)
+        vz = np.random.uniform(vz_low, vz_high)
+        self.mass = c.mass * np.random.uniform(0.5, 0.8)
+        self.data.qpos[:] = np.array([x, y, z + self.lander_radius], dtype=np.float64)
+        self.data.qvel[:] = np.array([vx, vy, vz], dtype=np.float64)
+        self._set_mass(self.mass)
+        self.data.xfrc_applied.fill(0.0)
+        mujoco.mj_forward(self.model, self.data)
         self.step_count = 0
-        return self.state.copy()
+        return self._get_state()
 
     def step(self, action):
         c = self.cfg
-        x, z, vx, vz, mass = self.state
+        x, y, z, vx, vy, vz, mass = self._get_state()
+        horiz_pos = np.hypot(x, y)
+        horiz_vel = np.hypot(vx, vy)
+        prev_goal_cost = (
+            0.02 * horiz_pos +
+            0.005 * max(z, 0.0) +
+            0.02 * horiz_vel +
+            0.04 * abs(vz)
+        )
         action = np.clip(action, -1, 1)
-        Tx, Tz = action * c.T_max
+        tx_cmd = action[0]
+        ty_cmd = action[1]
+        throttle_cmd = 0.5 * (action[2] + 1.0)  # [-1, 1] -> [0, 1]
+        Tx = tx_cmd * 0.3 * c.T_max
+        Ty = ty_cmd * 0.3 * c.T_max
+        Tz = c.T_max * (c.T_min + throttle_cmd * (1.0 - c.T_min))
 
-        ax = Tx / mass
-        az = Tz / mass - c.g
-
-        vx += ax * c.dt
-        vz += az * c.dt
-        x  += vx * c.dt
-        z  += vz * c.dt
-
-        T_norm = np.linalg.norm(action * c.T_max)
+        T_norm = np.linalg.norm([Tx, Ty, Tz])
         dm = T_norm / (c.Isp * self.g0) * c.dt
-        mass = max(mass - dm, c.mass * 0.1)
-
-        self.state = np.array([x, z, vx, vz, mass], dtype=np.float32)
+        self.data.xfrc_applied[self.lander_body_id, :3] = np.array([Tx, Ty, Tz], dtype=np.float64)
+        for _ in range(self.frame_skip):
+            mujoco.mj_step(self.model, self.data)
+        self.data.xfrc_applied[self.lander_body_id, :3] = 0.0
+        self.mass = max(mass - dm, c.mass * 0.1)
+        self._set_mass(self.mass)
+        mujoco.mj_forward(self.model, self.data)
         self.step_count += 1
 
-        pos_err = abs(x)
-        vel_err = np.sqrt(vx**2 + vz**2)
-
-        # Paper objective 1: landing error (always active)
-        error_pen = -pos_err * 0.005
-
-        # Paper objective 2: fuel (always active, mild)
-        fuel_pen  = -T_norm / (c.T_max * 150.0)
-
-        # Mild altitude ceiling — flew_away termination handles the hard case
-        alt_pen   = -max(0, z - c.alt_init) * 0.005
-
-        reward = error_pen + fuel_pen + alt_pen
+        x, y, z, vx, vy, vz, mass = self._get_state()
+        pos_err = np.hypot(x, y)
+        horiz_vel = np.hypot(vx, vy)
+        vel_err = np.sqrt(vx**2 + vy**2 + vz**2)
+        goal_cost = (
+            0.02 * pos_err +
+            0.005 * max(z, 0.0) +
+            0.02 * horiz_vel +
+            0.04 * abs(vz)
+        )
+        fuel_pen = T_norm / (c.T_max * 200.0)
+        lat_thrust_pen = np.sqrt(Tx**2 + Ty**2) / (c.T_max * 300.0)
+        reward = prev_goal_cost - goal_cost - fuel_pen - lat_thrust_pen
 
         done = False; info = {}
-        # Termination 1: hit the ground
-        if z <= 0:
+        # Termination 1: touched the ground
+        if self._has_ground_contact() or z <= 0:
             done = True
-            reward += max(0, 200 - pos_err)   # continuous proximity bonus
-            info = {"success": pos_err < c.pos_tol and vel_err < c.vel_tol,
-                    "pos_err": pos_err, "vel_err": vel_err}
+            success_relaxed = pos_err < c.pos_tol and vel_err < c.vel_tol
+            success_strict = pos_err < c.pos_tol_strict and vel_err < c.vel_tol
+            touchdown_score = 180.0 - 0.05 * pos_err - 3.0 * horiz_vel - 1.5 * abs(vz)
+            reward += touchdown_score
+            if success_relaxed:
+                reward += 150.0
+            info = {"success": success_relaxed,
+                    "success_relaxed": success_relaxed,
+                    "success_strict": success_strict,
+                    "pos_err": pos_err, "vel_err": vel_err,
+                    "x_err": x, "y_err": y}
 
         # Termination 2: flew too high
         elif z > c.alt_init * 1.5:
             done = True
-            reward -= 100.0
+            reward -= 300.0 + 0.05 * pos_err + 0.05 * max(z, 0.0)
             info = {"success": False, "flew_away": True}
 
         # Termination 3: drifted too far horizontally
         elif pos_err > 2000.0:
             done = True
-            reward -= 50.0
+            reward -= 250.0 + 0.05 * pos_err
             info = {"success": False, "drifted": True}
 
         elif self.step_count >= c.max_steps:
             done = True
+            reward -= 300.0 + 0.05 * pos_err + 0.05 * max(z, 0.0)
             info = {"timeout": True, "success": False}
 
-        return self.state.copy(), float(reward), done, info
+        return self._get_state(), float(reward), done, info
+
+    def _set_mass(self, mass: float):
+        self.model.body_mass[self.lander_body_id] = mass
+
+    def _get_state(self):
+        x = float(self.data.qpos[0])
+        y = float(self.data.qpos[1])
+        z = max(0.0, float(self.data.qpos[2]) - self.lander_radius)
+        vx = float(self.data.qvel[0])
+        vy = float(self.data.qvel[1])
+        vz = float(self.data.qvel[2])
+        return np.array([x, y, z, vx, vy, vz, self.mass], dtype=np.float32)
+
+    def _has_ground_contact(self) -> bool:
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            geoms = {int(contact.geom1), int(contact.geom2)}
+            if self.lander_geom_id in geoms and self.ground_geom_id in geoms:
+                return True
+        return False
 
 
 # ─────────────────────────────────────────────
@@ -440,15 +535,16 @@ class RewardHead(nn.Module):
         self.n_bins = n_bins
         self.net = mlp(cfg.deter_dim + cfg.stoch_dim * cfg.stoch_classes,
                        n_bins, cfg.hidden_dim, layers=2)
-        # Register bins: symlog-spaced from -20 to +20
-        bins = symexp(torch.linspace(-10, 10, n_bins))
+        # Bins live in symlog space; predictions are mapped back with symexp.
+        bins = torch.linspace(-10, 10, n_bins)
         self.register_buffer("bins", bins)
 
     def forward(self, feat: torch.Tensor) -> torch.Tensor:
         """Returns predicted reward (scalar)."""
         logits = self.net(feat)
         probs = torch.softmax(logits, -1)
-        return (probs * self.bins).sum(-1)
+        pred_symlog = (probs * self.bins).sum(-1)
+        return symexp(pred_symlog)
 
     def loss(self, feat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Two-hot symlog loss."""
@@ -477,7 +573,7 @@ class ContinueHead(nn.Module):
 class Actor(nn.Module):
     """
     Continuous action actor.
-    Outputs tanh-squashed Normal distribution over [Tx, Ty, Tz].
+    Outputs tanh-squashed Normal distribution over [tx_cmd, ty_cmd, throttle_cmd].
     """
     def __init__(self, cfg: DreamerConfig):
         super().__init__()
@@ -486,7 +582,10 @@ class Actor(nn.Module):
         self.mean_head = nn.Linear(cfg.hidden_dim, cfg.action_dim)
         self.std_head  = nn.Linear(cfg.hidden_dim, cfg.action_dim)
         nn.init.zeros_(self.mean_head.weight)
+        nn.init.zeros_(self.mean_head.bias)
         nn.init.zeros_(self.std_head.weight)
+        nn.init.zeros_(self.std_head.bias)
+        self.mean_head.bias.data[2] = -2.0  # low initial throttle bias
 
     def forward(self, feat: torch.Tensor,
                 sample: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -512,7 +611,7 @@ class Critic(nn.Module):
         latent = cfg.deter_dim + cfg.stoch_dim * cfg.stoch_classes
         self.n_bins = n_bins
         self.net = mlp(latent, n_bins, cfg.hidden_dim, layers=3)
-        bins = symexp(torch.linspace(-10, 10, n_bins))
+        bins = torch.linspace(-10, 10, n_bins)
         self.register_buffer("bins", bins)
         # Zero-initialize last layer (helps early training)
         nn.init.zeros_(list(self.net.children())[-1].weight)
@@ -521,7 +620,8 @@ class Critic(nn.Module):
     def forward(self, feat: torch.Tensor) -> torch.Tensor:
         logits = self.net(feat)
         probs = torch.softmax(logits, -1)
-        return (probs * self.bins).sum(-1)  # expected value
+        pred_symlog = (probs * self.bins).sum(-1)
+        return symexp(pred_symlog)  # expected value in original space
 
     def loss(self, feat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         logits = self.net(feat)
@@ -592,8 +692,15 @@ class DreamerV3(nn.Module):
         # Encode all observations
         embeds = self.encoder(obs.reshape(T*B, -1)).reshape(T, B, -1)
 
+        # RSSM expects a_{t-1} for obs_t. Replay stores a_t alongside obs_t,
+        # so shift actions by one and prepend zeros at sequence start.
+        prev_actions = torch.cat([
+            torch.zeros(1, B, self.cfg.action_dim, device=actions.device, dtype=actions.dtype),
+            actions[:-1],
+        ], dim=0)
+
         # RSSM forward pass
-        rssm_out = self.rssm.observe_sequence(embeds, actions)
+        rssm_out = self.rssm.observe_sequence(embeds, prev_actions)
         h = rssm_out["h"]; z = rssm_out["z"]
         feat = self.latent_feat(h, z)
 
@@ -612,17 +719,19 @@ class DreamerV3(nn.Module):
         prior_logits = rssm_out["prior_logits"]   # (T, B, stoch, classes)
         post_logits  = rssm_out["post_logits"]
 
-        # KL(posterior || prior)
+        # KL balancing with stop-gradients:
+        # α * KL(post_sg || prior) + (1-α) * KL(post || prior_sg)
         post_probs  = torch.softmax(post_logits, -1)
         prior_probs = torch.softmax(prior_logits, -1)
-        kl_lhs = (post_probs * (torch.log(post_probs + 1e-8) -
-                                 torch.log(prior_probs + 1e-8))).sum(-1).sum(-1)
-        kl_rhs = (prior_probs * (torch.log(prior_probs + 1e-8) -
-                                  torch.log(post_probs + 1e-8))).sum(-1).sum(-1)
+        post_probs_sg = post_probs.detach()
+        prior_probs_sg = prior_probs.detach()
+        kl_lhs = (post_probs_sg * (torch.log(post_probs_sg + 1e-8) -
+                                   torch.log(prior_probs + 1e-8))).sum(-1).sum(-1)
+        kl_rhs = (post_probs * (torch.log(post_probs + 1e-8) -
+                                torch.log(prior_probs_sg + 1e-8))).sum(-1).sum(-1)
 
-        # KL balancing: α * KL(post_sg || prior) + (1-α) * KL(post || prior_sg)
         alpha = self.cfg.kl_balance
-        kl_loss = (alpha * kl_lhs.detach().mean() +
+        kl_loss = (alpha * kl_lhs.mean() +
                    (1 - alpha) * kl_rhs.mean())
         # Free bits
         kl_loss = torch.clamp(kl_loss, min=self.cfg.kl_free)
@@ -751,16 +860,21 @@ class DreamerV3(nn.Module):
 
     @torch.no_grad()
     def act(self, obs: np.ndarray, h: torch.Tensor,
-            z: torch.Tensor, sample: bool = True):
+            z: torch.Tensor, prev_action: Optional[np.ndarray] = None,
+            sample: bool = True):
         """
         Select action given current observation and RSSM state.
         Returns (action, new_h, new_z) — h, z must be tracked across steps.
         """
         obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+        if prev_action is None:
+            prev_action_t = torch.zeros(1, self.cfg.action_dim, device=self.device)
+        else:
+            prev_action_t = torch.as_tensor(prev_action, dtype=torch.float32,
+                                            device=self.device).unsqueeze(0)
         embed = self.encoder(obs_t)
         h, z, _, _ = self.rssm.step_posterior(h, z,
-                                               torch.zeros(1, self.cfg.action_dim,
-                                                           device=self.device),
+                                               prev_action_t,
                                                embed)
         feat = self.latent_feat(h, z)
         action, _ = self.actor(feat, sample=sample)
@@ -821,6 +935,39 @@ class EpisodeBuffer:
 # TRAINING LOOP
 # ─────────────────────────────────────────────
 
+def curriculum_difficulty(total_steps: int) -> float:
+    """Stage difficulty so the agent learns centering on easy starts first."""
+    if total_steps < 50_000:
+        return 0.0
+    if total_steps < 100_000:
+        return 0.2
+    if total_steps < 150_000:
+        return 0.4
+    return min(1.0, 0.4 + (total_steps - 150_000) / 150_000 * 0.6)
+
+
+def pd_guidance_action(obs: np.ndarray, cfg: PDGConfig) -> np.ndarray:
+    """Simple classical PD baseline in the same action space as the actor."""
+    x, y, z, vx, vy, vz, mass = obs
+    horiz_kp = 0.015
+    horiz_kd = 0.12
+    vz_target = -20.0 if z > 800.0 else (-8.0 if z > 100.0 else -2.0)
+    vert_kp = 0.0
+    vert_kd = 0.35
+
+    ax_des = -horiz_kp * x - horiz_kd * vx
+    ay_des = -horiz_kp * y - horiz_kd * vy
+    az_des = -vert_kp * max(z, 0.0) + vert_kd * (vz_target - vz)
+
+    max_lat_acc = 0.3 * cfg.T_max / max(mass, cfg.mass * 0.1)
+    tx_cmd = np.clip(ax_des / max(max_lat_acc, 1e-6), -1.0, 1.0)
+    ty_cmd = np.clip(ay_des / max(max_lat_acc, 1e-6), -1.0, 1.0)
+
+    thrust_z = mass * (cfg.g + az_des)
+    throttle = np.clip((thrust_z / cfg.T_max - cfg.T_min) / max(1.0 - cfg.T_min, 1e-6), 0.0, 1.0)
+    throttle_cmd = 2.0 * throttle - 1.0
+    return np.array([tx_cmd, ty_cmd, throttle_cmd], dtype=np.float32)
+
 def train_dreamerv3(n_env_steps: int = 100_000,
                     train_every: int = 5,
                     seed_episodes: int = 10,
@@ -867,10 +1014,10 @@ def train_dreamerv3(n_env_steps: int = 100_000,
     total_steps = 0
     n_updates = 0
 
-    # ── Seed episodes (random policy)
+    # ── Seed episodes (random actions)
     print(f"\n  Collecting {seed_episodes} seed episodes...")
     for i in range(seed_episodes):
-        obs = env.reset(seed=i, difficulty=0.1)
+        obs = env.reset(seed=i, difficulty=0.0)
         ep = {"obs": [], "actions": [], "rewards": [], "dones": []}
         done = False
         while not done:
@@ -894,16 +1041,18 @@ def train_dreamerv3(n_env_steps: int = 100_000,
     obs = env.reset(seed=1000, difficulty=0.0)
     h = torch.zeros(1, dream_cfg.deter_dim, device=device)
     z = torch.zeros(1, dream_cfg.stoch_dim * dream_cfg.stoch_classes, device=device)
+    prev_action = np.zeros(dream_cfg.action_dim, dtype=np.float32)
     ep = {"obs": [], "actions": [], "rewards": [], "dones": []}
     ep_return = 0.0
 
     while total_steps < n_env_steps:
         # Collect one step
-        action, h, z = agent.act(obs, h, z, sample=True)
+        action, h, z = agent.act(obs, h, z, prev_action=prev_action, sample=True)
         next_obs, r, done, info = env.step(action)
         ep["obs"].append(obs); ep["actions"].append(action)
         ep["rewards"].append(r); ep["dones"].append(float(done))
         obs = next_obs
+        prev_action = action
         ep_return += r
         total_steps += 1
 
@@ -929,12 +1078,13 @@ def train_dreamerv3(n_env_steps: int = 100_000,
                 }, f"dreamerv3_ckpt_ep{ep_num}.pth")
                 print(f"  💾 Checkpoint → dreamerv3_ckpt_ep{ep_num}.pth")
 
-            difficulty = min(1.0, total_steps / 100_000)
+            difficulty = curriculum_difficulty(total_steps)
             env.training_steps = total_steps
             obs = env.reset(difficulty=difficulty)
             h = torch.zeros(1, dream_cfg.deter_dim, device=device)
             z = torch.zeros(1, dream_cfg.stoch_dim * dream_cfg.stoch_classes,
                             device=device)
+            prev_action = np.zeros(dream_cfg.action_dim, dtype=np.float32)
             ep = {"obs": [], "actions": [], "rewards": [], "dones": []}
             ep_return = 0.0
 
@@ -953,48 +1103,129 @@ def train_dreamerv3(n_env_steps: int = 100_000,
                 metrics["success_rate"].append(np.mean(recent_success) if recent_success else 0)
                 metrics["env_steps"].append(total_steps)
 
-    # ── Final evaluation
-    print("\n  Running final evaluation (50 episodes)...")
+    # ── Final evaluation across fixed difficulty levels
+    print("\n  Running final evaluation (50 episodes per difficulty)...")
     eval_results = evaluate(agent, env, n_episodes=50, device=device)
+    baseline_results = evaluate_pd_baseline(env, n_episodes=50)
 
     if plot:
-        _plot_training(metrics, eval_results, pdg_cfg)
+        _plot_training(metrics, eval_results, pdg_cfg, baseline_results)
 
-    return agent, metrics, eval_results
+    return agent, metrics, {"agent": eval_results, "pd_baseline": baseline_results}
 
 
 def evaluate(agent: DreamerV3, env: MarsPDGEnv,
-             n_episodes: int = 50, device: str = "cpu") -> dict:
-    """Evaluate trained agent."""
+             n_episodes: int = 50, device: str = "cpu",
+             difficulties: Tuple[float, ...] = (0.0, 0.3, 0.6, 1.0)) -> dict:
+    """Evaluate trained agent across fixed difficulty levels."""
     cfg = agent.cfg
-    results = []
-    trajectories = []
+    all_results = {"summaries": {}}
 
-    for ep in range(n_episodes):
-        obs = env.reset(seed=5000 + ep)
-        h = torch.zeros(1, cfg.deter_dim, device=device)
-        z = torch.zeros(1, cfg.stoch_dim * cfg.stoch_classes, device=device)
-        done = False; ep_return = 0.0; traj = [obs.copy()]
+    for difficulty in difficulties:
+        results = []
+        trajectories = []
 
-        while not done:
-            action, h, z = agent.act(obs, h, z, sample=False)  # deterministic
-            obs, r, done, info = env.step(action)
-            ep_return += r; traj.append(obs.copy())
+        for ep in range(n_episodes):
+            obs = env.reset(seed=5000 + ep, difficulty=difficulty)
+            h = torch.zeros(1, cfg.deter_dim, device=device)
+            z = torch.zeros(1, cfg.stoch_dim * cfg.stoch_classes, device=device)
+            prev_action = np.zeros(cfg.action_dim, dtype=np.float32)
+            done = False; ep_return = 0.0; traj = [obs.copy()]
 
-        trajectories.append(np.array(traj))
-        results.append({"success": info.get("success", False),
-                         "return":  ep_return,
-                         "pos_err": info.get("pos_err", None),
-                         "vel_err": info.get("vel_err", None)})
+            while not done:
+                action, h, z = agent.act(obs, h, z, prev_action=prev_action,
+                                         sample=False)  # deterministic
+                obs, r, done, info = env.step(action)
+                prev_action = action
+                ep_return += r; traj.append(obs.copy())
 
-    n_succ = sum(r["success"] for r in results)
-    pos_errs = [r["pos_err"] for r in results if r["pos_err"] is not None]
-    print(f"  Success: {n_succ}/{n_episodes} ({100*n_succ/n_episodes:.0f}%)  "
-          f"Avg pos error: {np.mean(pos_errs):.1f}m" if pos_errs else "")
-    return {"results": results, "trajectories": trajectories}
+            trajectories.append(np.array(traj))
+            results.append({
+                "success": info.get("success_relaxed", info.get("success", False)),
+                "success_relaxed": info.get("success_relaxed", False),
+                "success_strict": info.get("success_strict", False),
+                "return": ep_return,
+                "pos_err": info.get("pos_err", None),
+                "vel_err": info.get("vel_err", None),
+                "x_err": info.get("x_err", None),
+                "y_err": info.get("y_err", None),
+            })
+
+        n_relaxed = sum(r["success_relaxed"] for r in results)
+        n_strict = sum(r["success_strict"] for r in results)
+        pos_errs = [r["pos_err"] for r in results if r["pos_err"] is not None]
+        if pos_errs:
+            print(
+                f"  diff={difficulty:.1f}  relaxed={n_relaxed}/{n_episodes} "
+                f"({100*n_relaxed/n_episodes:.0f}%)  strict={n_strict}/{n_episodes} "
+                f"({100*n_strict/n_episodes:.0f}%)  Avg pos error: {np.mean(pos_errs):.1f}m"
+            )
+        all_results["summaries"][difficulty] = {
+            "relaxed_rate": n_relaxed / n_episodes,
+            "strict_rate": n_strict / n_episodes,
+            "avg_pos_err": float(np.mean(pos_errs)) if pos_errs else None,
+        }
+        all_results[difficulty] = {"results": results, "trajectories": trajectories}
+
+    return all_results
 
 
-def _plot_training(metrics: dict, eval_results: dict, pdg_cfg: PDGConfig):
+def evaluate_pd_baseline(env: MarsPDGEnv, n_episodes: int = 50,
+                         difficulties: Tuple[float, ...] = (0.0, 0.3, 0.6, 1.0)) -> dict:
+    """Evaluate the hand-coded PD baseline for comparison."""
+    all_results = {"summaries": {}}
+    cfg = env.cfg
+
+    for difficulty in difficulties:
+        results = []
+        trajectories = []
+
+        for ep in range(n_episodes):
+            obs = env.reset(seed=9000 + ep, difficulty=difficulty)
+            done = False
+            ep_return = 0.0
+            traj = [obs.copy()]
+
+            while not done:
+                action = pd_guidance_action(obs, cfg)
+                obs, r, done, info = env.step(action)
+                ep_return += r
+                traj.append(obs.copy())
+
+            trajectories.append(np.array(traj))
+            results.append({
+                "success": info.get("success_relaxed", info.get("success", False)),
+                "success_relaxed": info.get("success_relaxed", False),
+                "success_strict": info.get("success_strict", False),
+                "return": ep_return,
+                "pos_err": info.get("pos_err", None),
+                "vel_err": info.get("vel_err", None),
+            })
+
+        n_relaxed = sum(r["success_relaxed"] for r in results)
+        n_strict = sum(r["success_strict"] for r in results)
+        pos_errs = [r["pos_err"] for r in results if r["pos_err"] is not None]
+        print(
+            f"  PD diff={difficulty:.1f}  relaxed={n_relaxed}/{n_episodes} "
+            f"({100*n_relaxed/n_episodes:.0f}%)  strict={n_strict}/{n_episodes} "
+            f"({100*n_strict/n_episodes:.0f}%)"
+            + (f"  Avg pos error: {np.mean(pos_errs):.1f}m" if pos_errs else "")
+        )
+        all_results["summaries"][difficulty] = {
+            "relaxed_rate": n_relaxed / n_episodes,
+            "strict_rate": n_strict / n_episodes,
+            "avg_pos_err": float(np.mean(pos_errs)) if pos_errs else None,
+        }
+        all_results[difficulty] = {"results": results, "trajectories": trajectories}
+
+    return all_results
+
+
+def _plot_training(metrics: dict, eval_results: dict, pdg_cfg: PDGConfig,
+                   baseline_results: Optional[dict] = None):
+    diff_keys = sorted(k for k in eval_results.keys() if isinstance(k, float))
+    plot_key = max(diff_keys)
+    plot_eval = eval_results[plot_key]
     fig = plt.figure(figsize=(22, 9))
     fig.patch.set_facecolor("#0d1117")
     gs = gridspec.GridSpec(2, 4, figure=fig, hspace=0.45, wspace=0.35)
@@ -1034,30 +1265,34 @@ def _plot_training(metrics: dict, eval_results: dict, pdg_cfg: PDGConfig):
     ax4.set_ylim(0, 100)
 
     # Row 2: Evaluation results
-    trajectories = eval_results["trajectories"]
-    results      = eval_results["results"]
+    trajectories = plot_eval["trajectories"]
+    results      = plot_eval["results"]
 
     ax5 = styled_ax(gs[1, 0:2])
     for traj, res in zip(trajectories[:15], results[:15]):
-        horiz = traj[:, 0]   # x position (2D: state=[x,z,vx,vz,mass])
-        alt   = traj[:, 1]   # z (altitude)
+        horiz = np.sqrt(traj[:, 0]**2 + traj[:, 1]**2)   # horizontal radius
+        alt   = traj[:, 2]   # z (altitude)
         color = "#00ff88" if res["success"] else "#ff6b6b"
         ax5.plot(horiz, alt, color=color, alpha=0.6, lw=1.2)
     ax5.axhline(0, color="white", lw=0.5, ls="--")
-    ax5.set_title("Descent Trajectories  (green=soft landing, red=crash/miss)",
+    ax5.set_title("Descent Trajectories  (horizontal radius vs altitude)",
                    color="white", fontsize=9)
-    ax5.set_xlabel("Horizontal Distance (m)"); ax5.set_ylabel("Altitude (m)")
+    ax5.set_xlabel("Horizontal Radius (m)"); ax5.set_ylabel("Altitude (m)")
 
     ax6 = styled_ax(gs[1, 2])
     for res, traj in zip(results, trajectories):
-        fx = traj[-1, 0]   # final x position
-        ax6.scatter(fx, 0, color="#00ff88" if res["success"] else "#ff6b6b",
+        fx = traj[-1, 0]
+        fy = traj[-1, 1]
+        ax6.scatter(fx, fy, color="#00ff88" if res["success"] else "#ff6b6b",
                     s=25, alpha=0.7, zorder=3)
     ax6.axvline(0, color="white", lw=0.8, ls="--")
-    ax6.axvspan(-pdg_cfg.pos_tol, pdg_cfg.pos_tol, color="#ffff00",
-                alpha=0.15, label=f"±{pdg_cfg.pos_tol}m")
-    ax6.set_title("Landing Scatter (2D)", color="white", fontsize=9)
-    ax6.set_xlabel("Final x (m)"); ax6.set_yticks([])
+    ax6.axhline(0, color="white", lw=0.8, ls="--")
+    landing_circle = plt.Circle((0, 0), pdg_cfg.pos_tol, color="#ffff00",
+                                alpha=0.12, label=f"{pdg_cfg.pos_tol}m radius")
+    ax6.add_patch(landing_circle)
+    ax6.set_title("Landing Scatter (x-y)", color="white", fontsize=9)
+    ax6.set_xlabel("Final x (m)"); ax6.set_ylabel("Final y (m)")
+    ax6.set_aspect("equal", adjustable="box")
     ax6.legend(fontsize=7, facecolor="#161b22", labelcolor="white", edgecolor="#30363d")
 
     ax7 = styled_ax(gs[1, 3])
@@ -1070,16 +1305,31 @@ def _plot_training(metrics: dict, eval_results: dict, pdg_cfg: PDGConfig):
     ax7.set_title("Landing Error Distribution", color="white", fontsize=9)
     ax7.legend(fontsize=7, facecolor="#161b22", labelcolor="white", edgecolor="#30363d")
 
-    n_succ = sum(r["success"] for r in results)
+    n_succ = sum(r["success_relaxed"] for r in results)
+    n_strict = sum(r["success_strict"] for r in results)
+    summary_text = "  ".join(
+        f"d={d:.1f}: {eval_results['summaries'][d]['relaxed_rate']*100:.0f}%/"
+        f"{eval_results['summaries'][d]['strict_rate']*100:.0f}%"
+        for d in diff_keys
+    )
+    baseline_text = ""
+    if baseline_results is not None:
+        baseline_text = "  |  PD " + "  ".join(
+            f"d={d:.1f}: {baseline_results['summaries'][d]['relaxed_rate']*100:.0f}%/"
+            f"{baseline_results['summaries'][d]['strict_rate']*100:.0f}%"
+            for d in diff_keys
+        )
     plt.suptitle(
-        f"DreamerV3 · Mars PDG  |  Success: {n_succ}/{len(results)} "
-        f"({100*n_succ/len(results):.0f}%)  |  RSSM World Model + Imagined Actor-Critic",
+        f"DreamerV3 · Mars PDG  |  Eval diff={plot_key:.1f}  |  "
+        f"Relaxed: {n_succ}/{len(results)} ({100*n_succ/len(results):.0f}%)  "
+        f"Strict: {n_strict}/{len(results)} ({100*n_strict/len(results):.0f}%)  |  "
+        f"{summary_text}{baseline_text}",
         color="white", fontsize=11, fontweight="bold")
 
     plt.savefig("dreamerv3_pdg_output.png", dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     print("  Saved → dreamerv3_pdg_output.png")
-    plt.show()
+    plt.close(fig)
 
 
 # ─────────────────────────────────────────────
